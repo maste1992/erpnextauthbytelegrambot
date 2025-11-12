@@ -6,6 +6,14 @@ const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const FormData = require('form-data');
 
+// // Vercel serverless function handler
+// module.exports = async (req, res) => {
+//   // Set CORS headers
+//   res.setHeader('Access-Control-Allow-Credentials', true);
+//   res.setHeader('Access-Control-Allow-Origin', '*');
+//   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+//   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
 // Check environment variables
 console.log('📋 Checking environment...');
 console.log('ERP_URL:', process.env.ERP_URL);
@@ -45,24 +53,161 @@ bot.onText(/\/start/, async (msg) => {
     console.log('🔄 /start command received from:', msg.from.id);
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    const userSession = userSessions[userId];
     
-    // Initialize user session
+    // Check if user is already logged in
+    if (userSession && userSession.isLoggedIn) {
+        await bot.sendMessage(chatId, 
+            `👋 Welcome back, ${userSession.firstName || 'User'}!\n` +
+            `You are already logged in.\n\n` +
+            `What would you like to do next?`,
+            {
+                reply_markup: {
+                    keyboard: [
+                        ['📋 View My Tasks'],
+                        ['📊 Task Status']
+                    ],
+                    resize_keyboard: true
+                }
+            }
+        );
+        return;
+    }
+
+    // Initialize or reset user session
     userSessions[userId] = { 
-        step: 'awaiting_email',
+        step: 'awaiting_start',
         telegramId: userId,
-        firstName: msg.from.first_name || 'User'
+        firstName: msg.from.first_name || 'User',
+        isLoggedIn: false
     };
 
     try {
-        // Send welcome message
+        // Send welcome message with start button
         await bot.sendMessage(chatId, 
             `👋 Welcome ${msg.from.first_name || 'there'} to ERPNext Task Bot!\n\n` +
-            `To get started, I'll need to link your ERPNext account.\n` +
-            `Please enter your ERPNext email address:`
+            `I can help you manage your ERPNext tasks right here in Telegram.`,
+            {
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
+                    ]
+                }
+            }
         );
-        console.log('✅ Welcome message sent to:', userId);
+        console.log('✅ Welcome message with start button sent to:', userId);
     } catch (error) {
         console.error('❌ Error sending welcome message:', error);
+    }
+});
+
+// Handle callback queries (for login button and task actions)
+bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    const userId = callbackQuery.from.id;
+    const data = callbackQuery.data;
+    
+    // Get or create user session
+    const userSession = userSessions[userId] || {};
+    
+    try {
+        if (data === 'start_over') {
+            // Reset user session
+            userSessions[userId] = {
+                step: 'awaiting_start',
+                telegramId: userId,
+                firstName: userSession.firstName || 'User',
+                isLoggedIn: false
+            };
+            
+            await bot.sendMessage(chatId, '🔁 Starting over...', {
+                reply_markup: { remove_keyboard: true }
+            });
+            
+            // Show start button again
+            await bot.sendMessage(chatId, 
+                `Let's try again! Click the button below to start.`,
+                {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
+                        ]
+                    }
+                }
+            );
+            
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return;
+        }
+        
+        if (data === 'confirm_login') {
+            if (!userSession.email || !userSession.password) {
+                throw new Error('Missing credentials');
+            }
+            
+            // Check if this email is already in use by another session
+            const existingUser = Object.values(userSessions).find(
+                session => session.email === userSession.email && 
+                         session.isLoggedIn && 
+                         session.telegramId !== userId
+            );
+            
+            if (existingUser) {
+                await bot.sendMessage(
+                    chatId,
+                    '❌ This email is already in use by another Telegram account.\n' +
+                    'Please log out from the other session or use a different email.'
+                );
+                await bot.answerCallbackQuery(callbackQuery.id);
+                return;
+            }
+            
+            // Login to ERPNext
+            const authResult = await authenticateWithERPNext(userSession.email, userSession.password);
+            if (!authResult.success) {
+                await bot.sendMessage(chatId, '❌ Login failed. Please try again.');
+                await bot.answerCallbackQuery(callbackQuery.id);
+                return;
+            }
+            
+            // Update user session
+            userSession.isLoggedIn = true;
+            userSession.step = 'idle';
+            
+            await bot.sendMessage(chatId, '👋 You are now logged in!', {
+                reply_markup: {
+                    keyboard: [
+                        ['📋 View My Tasks'],
+                        ['📊 Task Status']
+                    ],
+                    resize_keyboard: true
+                }
+            });
+            
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return;
+        }
+        
+        if (data === 'start_bot') {
+            // Update session
+            userSessions[userId] = {
+                ...userSession,
+                step: 'awaiting_email'
+            };
+            
+            // Ask for email
+            await bot.sendMessage(chatId, 
+                `🔐 Let's get you logged in!\n\n` +
+                `Please enter your ERPNext email address:`
+            );
+            
+            // Answer the callback query to remove the loading state
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return;
+        }
+    } catch (error) {
+        console.error('❌ Error in start bot callback:', error);
+        await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ An error occurred. Please try again.' });
     }
 });
 
@@ -119,14 +264,42 @@ bot.on('message', async (msg) => {
     if (!userSessions[userId]) {
         console.log('ℹ️ Initializing new session for user:', userId);
         userSessions[userId] = { 
-            step: 'awaiting_email',
+            step: 'awaiting_start',
             telegramId: userId,
-            firstName: msg.from.first_name || 'User'
+            firstName: msg.from.first_name || 'User',
+            isLoggedIn: false
         };
+        
+        // If user sends a message directly without starting, guide them to /start
+        await bot.sendMessage(chatId, 
+            `👋 Welcome! Please click /start to begin.`,
+            {
+                reply_markup: {
+                    keyboard: [['/start']],
+                    resize_keyboard: true
+                }
+            }
+        );
+        return;
     }
 
     const userSession = userSessions[userId];
     console.log('🔄 Processing step:', userSession.step, 'for user:', userId);
+
+    // If user is already logged in, show main menu
+    if (userSession.isLoggedIn && !text.startsWith('/')) {
+        const mainMenu = {
+            reply_markup: {
+                keyboard: [
+                    ['📋 View My Tasks'],
+                    ['📊 Task Status']
+                ],
+                resize_keyboard: true
+            }
+        };
+        await bot.sendMessage(chatId, 'What would you like to do next?', mainMenu);
+        return;
+    }
 
     try {
         switch (userSession.step) {
@@ -134,6 +307,20 @@ bot.on('message', async (msg) => {
                 // Basic email validation
                 if (!text.includes('@') || !text.includes('.')) {
                     await bot.sendMessage(chatId, '❌ Please enter a valid email address:');
+                    return;
+                }
+                
+                // Check if this email is already in use by another session
+                const existingUser = Object.values(userSessions).find(
+                    session => session.email === text && session.isLoggedIn && session.telegramId !== userId
+                );
+                
+                if (existingUser) {
+                    await bot.sendMessage(
+                        chatId,
+                        '❌ This email is already in use by another Telegram account.\n' +
+                        'Please log out from the other session or use a different email.'
+                    );
                     return;
                 }
                 
@@ -146,7 +333,7 @@ bot.on('message', async (msg) => {
                 userSession.password = text;
                 userSession.step = 'confirm_login';
                 
-                // Create login button
+                // Create login confirmation buttons
                 const loginKeyboard = {
                     reply_markup: {
                         inline_keyboard: [
@@ -853,6 +1040,323 @@ function formatFileSize(bytes) {
     return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
 }
 
+
+// Global variables (persist between function calls)
+global.userSessions = global.userSessions || {};
+global.statusOptionsCache = global.statusOptionsCache || {};
+global.bot = global.bot || null;
+
+// Initialize bot once
+function initializeBot() {
+  if (global.bot) return global.bot;
+
+  console.log('🔧 Starting Telegram Bot...');
+  console.log('📋 Checking environment...');
+  console.log('ERP_URL:', process.env.ERP_URL);
+  console.log('BOT_TOKEN exists:', !!process.env.TELEGRAM_BOT_TOKEN);
+
+  if (!process.env.TELEGRAM_BOT_TOKEN) {
+    throw new Error('❌ TELEGRAM_BOT_TOKEN is missing');
+  }
+
+  if (!process.env.ERP_URL) {
+    throw new Error('❌ ERP_URL is missing');
+  }
+
+  const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { 
+    polling: false // Disable polling for serverless
+  });
+
+  setupBotHandlers(bot);
+  global.bot = bot;
+  
+  console.log('🤖 Bot initialized successfully');
+  return bot;
+}
+
+// Setup bot handlers
+function setupBotHandlers(bot) {
+  const ERP_URL = process.env.ERP_URL;
+
+  // Handle /start command
+  bot.onText(/\/start/, async (msg) => {
+    console.log('🔄 /start command received from:', msg.from.id);
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    
+    // Initialize user session
+    global.userSessions[userId] = { 
+      step: 'awaiting_email',
+      telegramId: userId,
+      firstName: msg.from.first_name || 'User'
+    };
+
+    try {
+      await bot.sendMessage(chatId, 
+        `👋 Welcome ${msg.from.first_name || 'there'} to ERPNext Task Bot!\n\n` +
+        `To get started, I'll need to link your ERPNext account.\n` +
+        `Please enter your ERPNext email address:`
+      );
+      console.log('✅ Welcome message sent to:', userId);
+    } catch (error) {
+      console.error('❌ Error sending welcome message:', error);
+    }
+  });
+
+  // Handle text messages
+  bot.on('message', async (msg) => {
+    // Skip if message is a command or empty
+    if (!msg.text) return;
+    
+    console.log('📨 Message received:', msg.text, 'from:', msg.from.id);
+    
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
+
+    // Handle menu buttons
+    if (text === '📋 View My Tasks' || text === '/tasks') {
+      if (!global.userSessions[userId] || !global.userSessions[userId].email) {
+        return await bot.sendMessage(chatId, 'Please log in first using /start');
+      }
+      const userSession = global.userSessions[userId];
+      await showUserTasks(chatId, userSession.email, userSession.password, userId);
+      return;
+    } else if (text === '📊 Task Status' || text === '/status') {
+      const statusKeyboard = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '🔵 Open', callback_data: 'status_Open' },
+              { text: '🟡 Working', callback_data: 'status_Working' }
+            ],
+            [
+              { text: '✅ Completed', callback_data: 'status_Completed' },
+              { text: '❌ Cancelled', callback_data: 'status_Cancelled' },
+              { text: '👀 All', callback_data: 'status_All' }
+            ]
+          ]
+        }
+      };
+      await bot.sendMessage(chatId, '🔍 Select task status to filter:', statusKeyboard);
+      return;
+    }
+
+    // Skip if it's a command
+    if (text.startsWith('/')) return;
+
+    // Initialize session if it doesn't exist
+    if (!global.userSessions[userId]) {
+      console.log('ℹ️ Initializing new session for user:', userId);
+      global.userSessions[userId] = { 
+        step: 'awaiting_email',
+        telegramId: userId,
+        firstName: msg.from.first_name || 'User'
+      };
+    }
+
+    const userSession = global.userSessions[userId];
+    console.log('🔄 Processing step:', userSession.step, 'for user:', userId);
+
+    try {
+      switch (userSession.step) {
+        case 'awaiting_email':
+          // Basic email validation
+          if (!text.includes('@') || !text.includes('.')) {
+            await bot.sendMessage(chatId, '❌ Please enter a valid email address:');
+            return;
+          }
+          
+          userSession.email = text;
+          userSession.step = 'awaiting_password';
+          await bot.sendMessage(chatId, '🔑 Great! Now, please enter your ERPNext password:');
+          break;
+
+        case 'awaiting_password':
+          userSession.password = text;
+          userSession.step = 'confirm_login';
+          
+          // Create login button
+          const loginKeyboard = {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '✅ Login to ERPNext', callback_data: 'confirm_login' }],
+                [{ text: '↩️ Start Over', callback_data: 'start_over' }]
+              ]
+            }
+          };
+          
+          await bot.sendMessage(
+            chatId,
+            `🔐 Ready to link your account?\n\n` +
+            `Email: ${userSession.email}\n` +
+            `Click the button below to confirm and link your account.`,
+            loginKeyboard
+          );
+          break;
+          
+        default:
+          // If we're in a different state, show the task management buttons
+          const taskKeyboard = {
+            reply_markup: {
+              keyboard: [
+                ['📋 View My Tasks'],
+                ['📊 Task Status']
+              ],
+              resize_keyboard: true
+            }
+          };
+          await bot.sendMessage(chatId, 'What would you like to do next?', taskKeyboard);
+      }
+    } catch (error) {
+      console.error('❌ Error in message handler:', error);
+      await bot.sendMessage(chatId, '❌ An error occurred. Please try /start again.');
+      delete global.userSessions[userId];
+    }
+  });
+
+  // Handle callback queries (for login button and task actions)
+  bot.on('callback_query', async (callbackQuery) => {
+    const chatId = callbackQuery.message.chat.id;
+    const userId = callbackQuery.from.id;
+    const data = callbackQuery.data;
+    
+    await bot.answerCallbackQuery(callbackQuery.id);
+    
+    if (!global.userSessions[userId]) {
+      return await bot.sendMessage(chatId, '❌ Session expired. Please /start again.');
+    }
+    
+    const userSession = global.userSessions[userId];
+    
+    try {
+      if (data === 'confirm_login') {
+        if (!userSession.email || !userSession.password) {
+          throw new Error('Missing credentials');
+        }
+        
+        await bot.editMessageText('🔗 Linking your account... Please wait...', {
+          chat_id: chatId,
+          message_id: callbackQuery.message.message_id
+        });
+        
+        // Call the link account function
+        await linkTelegramAccount(chatId, userSession.email, userSession.password, userId);
+        
+        // Show task management buttons after successful login
+        const taskKeyboard = {
+          reply_markup: {
+            keyboard: [
+              ['📋 View My Tasks'],
+              ['📊 Task Status']
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: true
+          }
+        };
+        
+        await bot.sendMessage(
+          chatId,
+          '✅ Account linked successfully!\n\n' +
+          `📧 ERPNext: ${userSession.email}\n` +
+          `📱 Telegram: ${userId}\n\n` +
+          'You will now receive task assignment notifications! 🎯\n\n' +
+          'What would you like to do next?',
+          taskKeyboard
+        );
+        
+      } else if (data === 'start_over') {
+        // Reset user session
+        global.userSessions[userId] = { 
+          step: 'awaiting_email',
+          telegramId: userId,
+          firstName: userSession.firstName
+        };
+        
+        await bot.editMessageText('🔄 Okay, let\'s start over!\n\nPlease enter your ERPNext email address:', {
+          chat_id: chatId,
+          message_id: callbackQuery.message.message_id
+        });
+      } else if (data.startsWith('status_')) {
+        const status = data.replace('status_', '');
+        userSession.statusFilter = status === 'All' ? null : status;
+        
+        await bot.answerCallbackQuery(callbackQuery.id, {
+          text: status === 'All' ? 'Showing all tasks' : `Filtering by status: ${status}`
+        });
+        
+        // Show tasks with the selected status
+        if (userSession.email && userSession.password) {
+          await showUserTasks(chatId, userSession.email, userSession.password, userId);
+        }
+      } else if (data.startsWith('task_')) {
+        // Handle task detail view
+        const taskId = data.replace('task_', '');
+        await bot.answerCallbackQuery(callbackQuery.id, {
+          text: 'Loading task details...'
+        });
+        
+        if (userSession.email && userSession.password) {
+          await showTaskDetails(chatId, userSession.email, userSession.password, userId, taskId);
+        }
+      } else if (data === 'back_to_tasks') {
+        // Go back to task list
+        await bot.answerCallbackQuery(callbackQuery.id, {
+          text: 'Returning to task list...'
+        });
+        
+        if (userSession.email && userSession.password) {
+          await showUserTasks(chatId, userSession.email, userSession.password, userId);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error in callback handler:', error);
+      await bot.sendMessage(chatId, '❌ An error occurred: ' + error.message);
+    }
+  });
+}
+
+// Vercel serverless function handler
+module.exports = async (req, res) => {
+  // Set CORS headers
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  try {
+    // Initialize bot
+    const bot = initializeBot();
+    
+    // Handle webhook updates from Telegram
+    if (req.method === 'POST' && req.body) {
+      console.log('📨 Received webhook update from Telegram');
+      await bot.processUpdate(req.body);
+      res.status(200).json({ status: 'ok', message: 'Update processed' });
+    } else {
+      // GET request - show status
+      res.status(200).json({ 
+        status: 'Bot is running',
+        message: 'Send POST requests with Telegram webhook updates',
+        url: 'https://erpnext-telegram-g7cy22pt4-mastewals-projects-c001046f.vercel.app/api/telegram-link'
+      });
+    }
+  } catch (error) {
+    console.error('❌ Serverless function error:', error);
+    res.status(500).json({ 
+      error: 'Internal server error',
+      message: error.message 
+    });
+  }
+};
+
+
 // Show tasks to user with proper field mappings
 async function showUserTasks(chatId, email, password, telegramUserId) {
     try {
@@ -1197,6 +1701,21 @@ async function linkTelegramAccount(chatId, email, password, telegramUserId) {
             return await bot.sendMessage(chatId, '❌ Authentication failed.');
         }
 
+        // Store user session
+        if (!userSessions[telegramUserId]) {
+            userSessions[telegramUserId] = {};
+        }
+        
+        userSessions[telegramUserId] = {
+            ...userSessions[telegramUserId],
+            email: email,
+            password: password,
+            cookies: authResult.cookies,
+            isLoggedIn: true,
+            step: 'idle',
+            chatId: chatId
+        };
+
         // Update user's Telegram ID in ERPNext using API
         const apiKey = process.env.ERPNEXT_API_KEY;
         const apiSecret = process.env.ERPNEXT_API_SECRET;
@@ -1234,6 +1753,51 @@ async function linkTelegramAccount(chatId, email, password, telegramUserId) {
         );
 
         console.log('✅ Account linked for:', email);
+
+        // Initialize WebSocket connection
+        try {
+            const WebSocketHandler = require('./websocket-handler');
+            
+            // Get or create WebSocket handler instance
+            const wsHandler = new WebSocketHandler(bot);
+            
+            // Add user to WebSocket handler with session data
+            await wsHandler.ensureConnection();
+            
+            // Add user to connected users map
+            wsHandler.addUser(email, chatId, {
+                email: email,
+                telegramId: telegramUserId,
+                chatId: chatId,
+                cookies: authResult.cookies,
+                apiKey: process.env.ERPNEXT_API_KEY,
+                apiSecret: process.env.ERPNEXT_API_SECRET
+            });
+            
+            console.log(`✅ WebSocket connection initialized for ${email}`);
+            await bot.sendMessage(chatId, 
+                '🔔 *Connected to ERPNext!*\n\n' +
+                'You will now receive real-time task notifications. Here\'s what you can do:\n\n' +
+                '• View your tasks with /mytasks\n' +
+                '• Get task updates automatically\n' +
+                '• Receive notifications for new assignments\n\n' +
+                'Type /help anytime to see available commands.',
+                { parse_mode: 'Markdown' }
+            );
+            
+            // Subscribe to task updates
+            await wsHandler.subscribeToTaskUpdates();
+            
+        } catch (wsError) {
+            console.error('❌ WebSocket initialization error:', wsError);
+            await bot.sendMessage(chatId, 
+                '⚠️ *Connection Warning*\n\n' +
+                'Real-time notifications might not work properly. ' +
+                'The bot will still function, but you might need to refresh manually to see updates.\n\n' +
+                'Error: ' + (wsError.message || 'Unknown error'),
+                { parse_mode: 'Markdown' }
+            );
+        }
 
     } catch (error) {
         console.error('❌ Linking error:', error);
@@ -1334,3 +1898,7 @@ bot.on('polling_error', (error) => {
 
 console.log('🚀 Telegram Bot is now running and listening for messages...');
 console.log('💡 Send /start to your bot to test it');
+
+// Return success response
+
+

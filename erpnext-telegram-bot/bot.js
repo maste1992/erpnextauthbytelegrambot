@@ -2,18 +2,30 @@ require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const axios = require('axios');
+const { showLoginPopup, handleLoginCallback, handleLoginMessage } = require('./api/login-popup');
+const WebSocketHandler = require('./api/websocket-handler');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Initialize Telegram Bot
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {polling: true});
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
+
+// Initialize WebSocket Handler
+const wsHandler = new WebSocketHandler(bot);
 
 // ERPNext API Configuration
 const ERP_URL = process.env.ERP_URL || 'https://erp.tibebgroup.com';
 
 // Store user sessions
 const userSessions = {};
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('Shutting down gracefully...');
+    wsHandler.disconnect();
+    process.exit(0);
+});
 
 // Handle /start command
 bot.onText(/\/start/, (msg) => {
@@ -25,57 +37,52 @@ bot.onText(/\/start/, (msg) => {
         telegramId: userId
     };
 
-    bot.sendMessage(chatId, '👋 Welcome to ERPNext Bot! Please enter your ERPNext email:');
+    // Show the login popup
+    showLoginPopup(bot, chatId, userId);
+});
+
+// Handle callback queries (for login buttons)
+bot.on('callback_query', async (callbackQuery) => {
+    const data = callbackQuery.data;
+    
+    // Check if it's a login-related callback
+    if (data.startsWith('enter_') || data === 'submit_login' || data === 'show_login_form') {
+        await handleLoginCallback(bot, callbackQuery, data);
+        return;
+    }
+    
+    // Handle other callbacks here if needed
 });
 
 // Handle all text messages
-bot.on('message', async (msg) => {
-    if (!msg.text || msg.text.startsWith('/')) return;
+bot.on('message', (msg) => {
+    // Skip if message is a command
+    if (msg.text && msg.text.startsWith('/')) return;
     
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = msg.text.trim();
-
-    if (!userSessions[userId]) {
-        return bot.sendMessage(chatId, 'Please use /start to begin the authentication process.');
-    }
-
-    const userSession = userSessions[userId];
-
-    try {
-        switch (userSession.step) {
-            case 'awaiting_email':
-                userSession.email = text;
-                userSession.step = 'awaiting_password';
-                bot.sendMessage(chatId, '🔑 Please enter your ERPNext password:');
-                break;
-
-            case 'awaiting_password':
-                userSession.password = text;
-                userSession.step = 'ready_to_login';
-                
-                // Show login button instead of auto-login
-                const loginButton = {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: '🚀 Login & Link Telegram ID', callback_data: 'login_and_link' }]
-                        ]
-                    }
-                };
-                
-                await bot.sendMessage(
-                    chatId, 
-                    `✅ Credentials received!\n\n📧 Email: ${userSession.email}\n🔐 Password: ••••••••\n\nClick the button below to login and link your Telegram ID:`,
-                    loginButton
-                );
-                break;
-        }
-    } catch (error) {
-        console.error('Unexpected error:', error);
-        await bot.sendMessage(chatId, '❌ An unexpected error occurred. Please try again with /start');
-        delete userSessions[userId];
+    // Try to handle the message with the login handler
+    const wasLoginMessage = handleLoginMessage(bot, msg);
+    
+    // If it wasn't a login message, handle other message types here
+    if (!wasLoginMessage) {
+        // Handle other message types
     }
 });
+
+// Show main menu after successful login
+function showMainMenu(chatId) {
+    const menu = {
+        reply_markup: {
+            keyboard: [
+                ['📋 My Tasks'],
+                ['⚙️ Settings']
+            ],
+            resize_keyboard: true,
+            one_time_keyboard: true
+        }
+    };
+    
+    bot.sendMessage(chatId, 'What would you like to do?', menu);
+}
 
 // Handle button clicks
 bot.on('callback_query', async (callbackQuery) => {
