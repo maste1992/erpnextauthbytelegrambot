@@ -1,18 +1,10 @@
-// api/telegram-link.js - Enhanced with dynamic status fetching from ERPNext
+// api/telegram-link.js - Enhanced with direct task viewing and duplicate user prevention
 require('dotenv').config();
 console.log('🔧 Starting Telegram Bot...');
 
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const FormData = require('form-data');
-
-// // Vercel serverless function handler
-// module.exports = async (req, res) => {
-//   // Set CORS headers
-//   res.setHeader('Access-Control-Allow-Credentials', true);
-//   res.setHeader('Access-Control-Allow-Origin', '*');
-//   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-//   res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
 // Check environment variables
 console.log('📋 Checking environment...');
@@ -48,29 +40,136 @@ let userSessions = {};
 let statusOptionsCache = {};
 const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
 
+// Track last seen tasks for each user
+const lastSeenTasks = {};
+
+// Store last check time for each user
+const lastTaskCheck = {};
+
+// Function to check if Telegram user ID is already linked
+async function isTelegramUserLinked(telegramUserId) {
+    try {
+        const apiKey = process.env.ERPNEXT_API_KEY;
+        const apiSecret = process.env.ERPNEXT_API_SECRET;
+        
+        if (!apiKey || !apiSecret) {
+            console.error('❌ API credentials missing for user check');
+            return false;
+        }
+
+        // Search for users with this Telegram ID
+        const response = await axios.get(
+            `${ERP_URL}/api/resource/User?fields=["name","email","telegram_user_id"]&filters=[["telegram_user_id","=","${telegramUserId}"]]`,
+            {
+                headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
+                timeout: 10000
+            }
+        );
+
+        const users = response.data.data || [];
+        return users.length > 0;
+
+    } catch (error) {
+        console.error('❌ Error checking Telegram user link:', error);
+        return false;
+    }
+}
+
+// Function to get ERPNext user by Telegram ID
+async function getERPNextUserByTelegramId(telegramUserId) {
+    try {
+        const apiKey = process.env.ERPNEXT_API_KEY;
+        const apiSecret = process.env.ERPNEXT_API_SECRET;
+        
+        if (!apiKey || !apiSecret) {
+            return null;
+        }
+
+        const response = await axios.get(
+            `${ERP_URL}/api/resource/User?fields=["name","email","first_name","full_name","telegram_user_id"]&filters=[["telegram_user_id","=","${telegramUserId}"]]`,
+            {
+                headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
+                timeout: 10000
+            }
+        );
+
+        const users = response.data.data || [];
+        return users.length > 0 ? users[0] : null;
+
+    } catch (error) {
+        console.error('❌ Error getting ERPNext user by Telegram ID:', error);
+        return null;
+    }
+}
+
 // Handle /start command
 bot.onText(/\/start/, async (msg) => {
     console.log('🔄 /start command received from:', msg.from.id);
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const userSession = userSessions[userId] || {};
     
-    // Initialize or update user session
-    userSessions[userId] = {
-        ...userSession,
-        step: 'awaiting_start',
-        telegramId: userId,
-        firstName: msg.from.first_name || 'User',
-        isLoggedIn: userSession.isLoggedIn || false,
-        notificationsEnabled: userSession.notificationsEnabled || false
-    };
-
     try {
-        if (userSession.isLoggedIn) {
+        // Check if user is already linked in ERPNext
+        const existingERPUser = await getERPNextUserByTelegramId(userId.toString());
+        
+        if (existingERPUser) {
+            console.log('✅ User already linked in ERPNext:', existingERPUser.email);
+            
+            // Check if we have active session
+            const userSession = userSessions[userId] || {};
+            
+            if (userSession.isLoggedIn && userSession.email === existingERPUser.email) {
+                // User is already logged in, show main menu
+                await bot.sendMessage(chatId, 
+                    `👋 Welcome back, ${existingERPUser.first_name || existingERPUser.full_name || 'User'}!\n` +
+                    `You're already logged in as: ${existingERPUser.email}\n\n` +
+                    `What would you like to do?`,
+                    {
+                        reply_markup: {
+                            keyboard: [
+                                ['📋 View My Tasks'],
+                                ['🔔 ' + (userSession.notificationsEnabled ? 'Disable' : 'Enable') + ' Notifications'],
+                                ['⚙️ Settings']
+                            ],
+                            resize_keyboard: true
+                        }
+                    }
+                );
+                return;
+            } else {
+                // User is linked in ERPNext but not logged in bot session
+                // Ask for password to authenticate
+                userSessions[userId] = {
+                    step: 'awaiting_password_for_linked_user',
+                    telegramId: userId,
+                    firstName: msg.from.first_name || 'User',
+                    email: existingERPUser.email,
+                    isLoggedIn: false,
+                    notificationsEnabled: userSession.notificationsEnabled || false,
+                    erpUser: existingERPUser
+                };
+                
+                await bot.sendMessage(chatId, 
+                    `👋 Welcome back, ${existingERPUser.first_name || existingERPUser.full_name || 'User'}!\n\n` +
+                    `Your Telegram account is already linked to ERPNext account:\n` +
+                    `📧 ${existingERPUser.email}\n\n` +
+                    `Please enter your ERPNext password to continue:`,
+                    { reply_markup: { remove_keyboard: true } }
+                );
+                return;
+            }
+        }
+
+        // New user flow
+        const userSession = userSessions[userId] || {};
+        
+        // Check if user is already logged in
+        if (userSession.isLoggedIn && userSession.email) {
+            // User is already logged in, show main menu
             await bot.sendMessage(chatId, 
                 `👋 Welcome back, ${userSession.firstName || 'User'}!\n` +
-                `Notifications: ${userSession.notificationsEnabled ? '🔔 ON' : '🔕 OFF'}\n\n` +
-                `What would you like to do next?`,
+                `You're logged in as: ${userSession.email}\n\n` +
+                `What would you like to do?`,
                 {
                     reply_markup: {
                         keyboard: [
@@ -84,24 +183,27 @@ bot.onText(/\/start/, async (msg) => {
             );
             return;
         }
-
-        // Send welcome message with notification and start buttons
+        
+        // Initialize or update user session
+        userSessions[userId] = {
+            ...userSession,
+            step: 'awaiting_email',
+            telegramId: userId,
+            firstName: msg.from.first_name || 'User',
+            isLoggedIn: false,
+            notificationsEnabled: userSession.notificationsEnabled || false
+        };
+        
+        // Ask for email
         await bot.sendMessage(chatId, 
-            `👋 Welcome ${msg.from.first_name || 'there'} to ERPNext Task Bot!\n\n` +
-            `I can help you manage your ERPNext tasks right here in Telegram.\n\n` +
-            `🔔 Enable notifications to get instant updates about your tasks!`,
-            {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '🔔 Enable Notifications', callback_data: 'enable_notifications' }],
-                        [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
-                    ]
-                }
-            }
+            `👋 Welcome to ERPNext Task Bot!\n\n` +
+            `Please enter your ERPNext email address:`,
+            { reply_markup: { remove_keyboard: true } }
         );
-        console.log('✅ Welcome message sent to:', userId);
+
     } catch (error) {
         console.error('❌ Error in /start command:', error);
+        await bot.sendMessage(chatId, '❌ An error occurred. Please try again.');
     }
 });
 
@@ -237,169 +339,123 @@ bot.on('callback_query', async (callbackQuery) => {
             await bot.answerCallbackQuery(callbackQuery.id);
             return;
         }
+
+        // Handle view task directly - THIS IS THE KEY UPDATE
+        if (data.startsWith('view_task_')) {
+            const taskId = data.replace('view_task_', '');
+            
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Loading task details...'
+            });
+            
+            // Show task details directly without going through task list
+            try {
+                if (userSession.email && userSession.password) {
+                    await showTaskDetails(chatId, userSession.email, userSession.password, userId, taskId);
+                } else if (userSession.cookies) {
+                    await showTaskDetails(chatId, userSession.email, userSession.cookies, userId, taskId);
+                } else {
+                    await bot.sendMessage(chatId, '❌ Please log in again to view task details.');
+                }
+            } catch (error) {
+                console.error('Error showing task details:', error);
+                await bot.sendMessage(chatId, '❌ Failed to load task details. Please try again.');
+            }
+            return;
+        }
+
+        // Handle other callback actions
+        if (data.startsWith('status_')) {
+            const status = data.replace('status_', '');
+            userSession.statusFilter = status === 'All' ? null : status;
+            
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: status === 'All' ? 'Showing all tasks' : `Filtering by status: ${status}`
+            });
+            
+            // Show tasks with the selected status
+            if (userSession.email && userSession.password) {
+                await showUserTasks(chatId, userSession.email, userSession.password, userId);
+            }
+        } else if (data.startsWith('task_')) {
+            // Handle task detail view from task list
+            const taskId = data.replace('task_', '');
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Loading task details...'
+            });
+            
+            if (userSession.email && userSession.password) {
+                await showTaskDetails(chatId, userSession.email, userSession.password, userId, taskId);
+            }
+        } else if (data === 'back_to_tasks') {
+            // Go back to task list
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Returning to task list...'
+            });
+            
+            if (userSession.email && userSession.password) {
+                await showUserTasks(chatId, userSession.email, userSession.password, userId);
+            }
+        } else if (data.startsWith('complete_')) {
+            // Mark task as completed
+            const taskId = data.replace('complete_', '');
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Marking task as completed...'
+            });
+            
+            if (userSession.email && userSession.password) {
+                await updateTaskStatus(chatId, userSession.email, userSession.password, taskId, 'Completed');
+            }
+        } else if (data.startsWith('update_')) {
+            // Show status update options
+            const taskId = data.replace('update_', '');
+            await showStatusUpdateOptions(chatId, userId, taskId);
+        } else if (data.startsWith('set_status_')) {
+            // Set specific status
+            const parts = data.replace('set_status_', '').split('_');
+            const taskId = parts[0];
+            const newStatus = parts[1];
+            
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: `Updating status to ${newStatus}...`
+            });
+            
+            if (userSession.email && userSession.password) {
+                await updateTaskStatus(chatId, userSession.email, userSession.password, taskId, newStatus);
+            }
+        } else if (data.startsWith('attach_')) {
+            // Prepare for file attachment
+            const taskId = data.replace('attach_', '');
+            userSession.pendingTaskIdForAttachment = taskId;
+            
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Ready to receive files. Please send your file or photo now.'
+            });
+            
+            await bot.sendMessage(chatId, 
+                `📎 Ready to attach files to task!\n\n` +
+                `Please send the file or photo you want to attach.\n` +
+                `You can send documents, images, or any other files.\n\n` +
+                `The file will be attached directly to the task in ERPNext.`
+            );
+        } else if (data.startsWith('view_attachments_')) {
+            // View task attachments
+            const taskId = data.replace('view_attachments_', '');
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: 'Loading attachments...'
+            });
+            
+            if (userSession.email && userSession.password) {
+                await showTaskAttachments(chatId, userSession.email, userSession.password, userId, taskId);
+            }
+        }
     } catch (error) {
-        console.error('❌ Error in start bot callback:', error);
+        console.error('❌ Error in callback handler:', error);
         await bot.answerCallbackQuery(callbackQuery.id, { text: '❌ An error occurred. Please try again.' });
     }
 });
 
 // Handle text messages
-// Function to format notification message with HTML formatting
-function formatNotification(notificationData) {
-    const { title, owner, reference_type, description } = notificationData;
-    
-    return `
-<b>${title || 'New Notification Arrived!'} <tg-emoji emoji-id="5368324170671202286">🔔</tg-emoji></b>
-  
-  Notification Details:
-    - <strong>Allocated by</strong>: ${owner || 'System'}
-    - <strong>Reference Type</strong>: ${reference_type || 'N/A'}
-    - <strong>Description</strong>: ${description || 'No description provided'}
-  
-  Tibeb Design & Build ERP
-  `;
-}
-
-// Function to send task assignment notification
-async function sendTaskAssignmentNotification(userId, taskDetails) {
-    try {
-        const userSession = userSessions[userId];
-        if (!userSession) return;
-        
-        const dueDate = taskDetails.exp_end_date ? formatDate(taskDetails.exp_end_date) : 'No due date';
-        const status = taskDetails.status || 'Open';
-        const statusIcon = getStatusIcon(status);
-        
-        // Format notification using the new function
-        const notificationMessage = formatNotification({
-            title: 'New Task Assigned!',
-            owner: taskDetails.owner || 'System',
-            reference_type: 'Task',
-            description: `📌 ${taskDetails.subject || 'No Subject'}\n` +
-                        `📝 ${taskDetails.description || 'No description'}\n` +
-                        `📅 Due: ${dueDate}\n` +
-                        `🏷️ Status: ${statusIcon} ${status}`
-        });
-        
-        await bot.sendMessage(userId, notificationMessage, {
-            parse_mode: 'HTML',
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: '📋 View Task', callback_data: `view_task_${taskDetails.name}` }],
-                    [
-                        { text: '✅ Mark as Done', callback_data: `status_${taskDetails.name}_Completed` },
-                        { text: '📅 Set Reminder', callback_data: `remind_${taskDetails.name}` }
-                    ]
-                ]
-            }
-        });
-    } catch (error) {
-        console.error('❌ Error sending task assignment notification:', error);
-    }
-}
-
-// Show task details when view task is clicked (using the main implementation below)
-
-// Track last seen tasks for each user
-const lastSeenTasks = {};
-
-// Function to check for new tasks and notify users
-async function checkAndNotifyNewTasks() {
-    try {
-        const now = new Date();
-        console.log(`🔍 Checking for new tasks at ${now.toISOString()}`);
-        
-        // Get all logged-in users with notifications enabled
-        const usersToNotify = Object.values(userSessions).filter(
-            user => user.isLoggedIn && user.email && user.telegramId
-        );
-        
-        for (const user of usersToNotify) {
-            try {
-                console.log(`🔍 Checking tasks for user: ${user.email}`);
-                
-                // Get user's tasks from ERPNext
-                const tasks = await getAssignedTasks(user.email, user.cookies);
-                console.log(`📋 Found ${tasks.length} tasks for ${user.email}`);
-                
-                // Initialize last seen tasks if not exists
-                if (!lastSeenTasks[user.telegramId]) {
-                    lastSeenTasks[user.telegramId] = [];
-                    console.log(`📝 Initialized task tracking for user ${user.email}`);
-                }
-                
-                // Get task IDs that are currently assigned
-                const currentTaskIds = tasks.map(task => task.name);
-                
-                // Find new tasks (those in current tasks but not in last seen)
-                const newTasks = tasks.filter(task => 
-                    !lastSeenTasks[user.telegramId].includes(task.name)
-                );
-
-                console.log(`🆕 Found ${newTasks.length} new tasks for ${user.email}`);
-                
-                // Send notifications for new tasks
-                for (const task of newTasks) {
-                    console.log(`📨 Sending notification for task: ${task.name}`);
-                    try {
-                        await sendTaskAssignmentNotification(user.telegramId, task);
-                        console.log(`✅ Notification sent for task ${task.name}`);
-                    } catch (notifyError) {
-                        console.error(`❌ Failed to send notification for task ${task.name}:`, notifyError);
-                    }
-                }
-                
-                // Update last seen tasks
-                lastSeenTasks[user.telegramId] = currentTaskIds;
-                
-            } catch (error) {
-                console.error(`❌ Error checking tasks for user ${user.email}:`, error);
-            }
-        }
-    } catch (error) {
-        console.error('❌ Error in task notification check:', error);
-    }
-}
-
-// Also check for new tasks when a user logs in
-async function checkTasksOnLogin(telegramId, email, cookies) {
-    try {
-        const tasks = await getAssignedTasks(email, cookies);
-        const userSession = userSessions[telegramId];
-        
-        if (userSession) {
-            // Only show notifications for tasks created in the last 24 hours
-            const oneDayAgo = new Date();
-            oneDayAgo.setDate(oneDayAgo.getDate() - 1);
-            
-            const recentTasks = tasks.filter(task => {
-                const taskDate = task.creation ? new Date(task.creation) : new Date(0);
-                return taskDate > oneDayAgo;
-            });
-            
-            // Update last check time to now to avoid duplicate notifications
-            lastTaskCheck[telegramId] = new Date();
-            
-            // Only show notification if there are tasks
-            if (recentTasks.length > 0) {
-                await bot.sendMessage(telegramId, `🔔 You have ${recentTasks.length} recent tasks. Use /tasks to view them.`);
-            }
-        }
-    } catch (error) {
-        console.error(`❌ Error checking tasks on login for user ${telegramId}:`, error);
-    }
-}
-
-// Store last check time for each user
-const lastTaskCheck = {};
-
-// Check for new tasks every 1 minute
-const TASK_CHECK_INTERVAL = 1 * 60 * 1000; // 1 minute
-setInterval(checkAndNotifyNewTasks, TASK_CHECK_INTERVAL);
-
-// Also run immediately on startup
-checkAndNotifyNewTasks().catch(console.error);
-
 bot.on('message', async (msg) => {
     // Skip if message is a command or empty
     if (!msg.text && !msg.document && !msg.photo) return;
@@ -565,6 +621,41 @@ bot.on('message', async (msg) => {
                     loginKeyboard
                 );
                 break;
+
+            case 'awaiting_password_for_linked_user':
+                // Handle password for already linked user
+                userSession.password = text;
+                
+                await bot.sendMessage(chatId, '🔄 Authenticating...');
+                
+                // Authenticate with ERPNext
+                const authResult = await authenticateWithERPNext(userSession.email, userSession.password);
+                if (!authResult.success) {
+                    await bot.sendMessage(chatId, '❌ Authentication failed. Please check your password and try again.');
+                    userSession.step = 'awaiting_password_for_linked_user';
+                    return;
+                }
+                
+                // Update user session
+                userSession.isLoggedIn = true;
+                userSession.step = 'idle';
+                userSession.cookies = authResult.cookies;
+                
+                await bot.sendMessage(chatId, 
+                    `✅ Successfully logged in!\n\n` +
+                    `Welcome back, ${userSession.erpUser.first_name || userSession.erpUser.full_name || 'User'}!\n` +
+                    `Your account is now connected.`,
+                    {
+                        reply_markup: {
+                            keyboard: [
+                                ['📋 View My Tasks'],
+                                ['📊 Task Status']
+                            ],
+                            resize_keyboard: true
+                        }
+                    }
+                );
+                break;
                 
             case 'awaiting_status_update':
                 // Handle status update from text input
@@ -597,110 +688,124 @@ bot.on('message', async (msg) => {
     }
 });
 
-// Fetch status options from ERPNext
-async function fetchStatusOptionsFromERPNext(email, password) {
+// Function to format notification message with HTML formatting
+function formatNotification(notificationData) {
+    const { title, owner, reference_type, description } = notificationData;
+    
+    return `
+<b>${title || 'New Notification Arrived!'} <tg-emoji emoji-id="5368324170671202286">🔔</tg-emoji></b>
+  
+  Notification Details:
+    - <strong>Allocated by</strong>: ${owner || 'System'}
+    - <strong>Reference Type</strong>: ${reference_type || 'N/A'}
+    - <strong>Description</strong>: ${description || 'No description provided'}
+  
+  Tibeb Design & Build ERP
+  `;
+}
+
+// Function to send task assignment notification
+async function sendTaskAssignmentNotification(userId, taskDetails) {
     try {
-        console.log('🔄 Fetching status options from ERPNext...');
+        const userSession = userSessions[userId];
+        if (!userSession) return;
         
-        const authResult = await authenticateWithERPNext(email, password);
-        if (!authResult.success) {
-            throw new Error('Authentication failed');
-        }
-
-        const apiKey = process.env.ERPNEXT_API_KEY;
-        const apiSecret = process.env.ERPNEXT_API_SECRET;
+        const dueDate = taskDetails.exp_end_date ? formatDate(taskDetails.exp_end_date) : 'No due date';
+        const status = taskDetails.status || 'Open';
+        const statusIcon = getStatusIcon(status);
         
-        if (!apiKey || !apiSecret) {
-            throw new Error('API credentials missing');
-        }
-
-        // Method 1: Try to get status options from Task doctype
-        try {
-            const response = await axios.get(
-                `${ERP_URL}/api/resource/DocType/Task`,
-                {
-                    headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
-                    timeout: 10000
-                }
-            );
-
-            const taskDocType = response.data.data;
-            
-            // Extract status options from the Select field
-            if (taskDocType && taskDocType.fields) {
-                const statusField = taskDocType.fields.find(field => field.fieldname === 'status');
-                if (statusField && statusField.options) {
-                    const statusOptions = statusField.options.split('\n').filter(option => option.trim() !== '');
-                    console.log('✅ Status options fetched from Task doctype:', statusOptions);
-                    return statusOptions;
-                }
+        // Format notification using the new function
+        const notificationMessage = formatNotification({
+            title: 'New Task Assigned!',
+            owner: taskDetails.owner || 'System',
+            reference_type: 'Task',
+            description: `📌 ${taskDetails.subject || 'No Subject'}\n` +
+                        `📝 ${taskDetails.description || 'No description'}\n` +
+                        `📅 Due: ${dueDate}\n` +
+                        `🏷️ Status: ${statusIcon} ${status}`
+        });
+        
+        await bot.sendMessage(userId, notificationMessage, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '📋 View Task Details', callback_data: `view_task_${taskDetails.name}` }],
+                    [
+                        { text: '✅ Mark as Done', callback_data: `status_${taskDetails.name}_Completed` },
+                        { text: '📅 Set Reminder', callback_data: `remind_${taskDetails.name}` }
+                    ]
+                ]
             }
-        } catch (error) {
-            console.log('⚠️ Could not fetch from Task doctype, trying alternative method...');
-        }
+        });
+    } catch (error) {
+        console.error('❌ Error sending task assignment notification:', error);
+    }
+}
 
-        // Method 2: Try to get from server script or custom field
-        try {
-            const customResponse = await axios.get(
-                `${ERP_URL}/api/method/frappe.desk.form.load.getdoc?doctype=Task&name=New%20Task%201`,
-                {
-                    headers: { 
-                        'Cookie': authResult.cookies.join('; ')
-                    },
-                    timeout: 10000
+// Function to check for new tasks and notify users
+async function checkAndNotifyNewTasks() {
+    try {
+        const now = new Date();
+        console.log(`🔍 Checking for new tasks at ${now.toISOString()}`);
+        
+        // Get all logged-in users with notifications enabled
+        const usersToNotify = Object.values(userSessions).filter(
+            user => user.isLoggedIn && user.email && user.telegramId
+        );
+        
+        for (const user of usersToNotify) {
+            try {
+                console.log(`🔍 Checking tasks for user: ${user.email}`);
+                
+                // Get user's tasks from ERPNext
+                const tasks = await getAssignedTasks(user.email, user.cookies);
+                console.log(`📋 Found ${tasks.length} tasks for ${user.email}`);
+                
+                // Initialize last seen tasks if not exists
+                if (!lastSeenTasks[user.telegramId]) {
+                    lastSeenTasks[user.telegramId] = [];
+                    console.log(`📝 Initialized task tracking for user ${user.email}`);
                 }
-            );
+                
+                // Get task IDs that are currently assigned
+                const currentTaskIds = tasks.map(task => task.name);
+                
+                // Find new tasks (those in current tasks but not in last seen)
+                const newTasks = tasks.filter(task => 
+                    !lastSeenTasks[user.telegramId].includes(task.name)
+                );
 
-            if (customResponse.data && customResponse.data.docs && customResponse.data.docs[0]) {
-                const taskDoc = customResponse.data.docs[0];
-                if (taskDoc.__server_messages) {
-                    const serverMessages = JSON.parse(taskDoc.__server_messages || '[]');
-                    // Look for status options in server messages
-                    for (const msg of serverMessages) {
-                        if (msg.message && msg.message.includes('status')) {
-                            // Parse status options from server message
-                            // This would depend on your ERPNext implementation
-                        }
+                console.log(`🆕 Found ${newTasks.length} new tasks for ${user.email}`);
+                
+                // Send notifications for new tasks
+                for (const task of newTasks) {
+                    console.log(`📨 Sending notification for task: ${task.name}`);
+                    try {
+                        await sendTaskAssignmentNotification(user.telegramId, task);
+                        console.log(`✅ Notification sent for task ${task.name}`);
+                    } catch (notifyError) {
+                        console.error(`❌ Failed to send notification for task ${task.name}:`, notifyError);
                     }
                 }
+                
+                // Update last seen tasks
+                lastSeenTasks[user.telegramId] = currentTaskIds;
+                
+            } catch (error) {
+                console.error(`❌ Error checking tasks for user ${user.email}:`, error);
             }
-        } catch (error) {
-            console.log('⚠️ Alternative method also failed');
         }
-
-        // Method 3: Fallback to common status options
-        console.log('🔄 Using fallback status options');
-        return ['Open', 'Working', 'Pending Review', 'Completed', 'Cancelled', 'On Hold', 'Overdue', 'Closed'];
-
     } catch (error) {
-        console.error('❌ Error fetching status options:', error);
-        // Return default options as fallback
-        return ['Open', 'Working', 'Pending Review', 'Completed', 'Cancelled', 'On Hold', 'Overdue', 'Closed'];
+        console.error('❌ Error in task notification check:', error);
     }
 }
 
-// Get status options with caching
-async function getStatusOptions(email, password) {
-    const cacheKey = `${email}_status_options`;
-    
-    // Check cache
-    if (statusOptionsCache[cacheKey] && 
-        Date.now() - statusOptionsCache[cacheKey].timestamp < CACHE_DURATION) {
-        console.log('📦 Using cached status options');
-        return statusOptionsCache[cacheKey].options;
-    }
-    
-    // Fetch fresh options
-    const options = await fetchStatusOptionsFromERPNext(email, password);
-    
-    // Update cache
-    statusOptionsCache[cacheKey] = {
-        options: options,
-        timestamp: Date.now()
-    };
-    
-    return options;
-}
+// Check for new tasks every 1 minute
+const TASK_CHECK_INTERVAL = 1 * 60 * 1000; // 1 minute
+setInterval(checkAndNotifyNewTasks, TASK_CHECK_INTERVAL);
+
+// Also run immediately on startup
+checkAndNotifyNewTasks().catch(console.error);
 
 // Handle file attachments and upload to ERPNext
 async function handleFileAttachment(chatId, userId, msg) {
@@ -846,747 +951,6 @@ async function uploadFileToERPNext(email, password, taskId, fileUrl, fileName, m
     }
 }
 
-// Handle callback queries (for login button and task actions)
-bot.on('callback_query', async (callbackQuery) => {
-    const chatId = callbackQuery.message.chat.id;
-    const userId = callbackQuery.from.id;
-    const data = callbackQuery.data;
-    
-    await bot.answerCallbackQuery(callbackQuery.id);
-    
-    if (!userSessions[userId]) {
-        return await bot.sendMessage(chatId, '❌ Session expired. Please /start again.');
-    }
-    
-    const userSession = userSessions[userId];
-    
-    try {
-        if (data === 'confirm_login') {
-            if (!userSession.email || !userSession.password) {
-                throw new Error('Missing credentials');
-            }
-            
-            await bot.editMessageText('🔗 Linking your account... Please wait...', {
-                chat_id: chatId,
-                message_id: callbackQuery.message.message_id
-            });
-            
-            // Call the link account function
-            await linkTelegramAccount(chatId, userSession.email, userSession.password, userId);
-            
-            // Show task management buttons after successful login
-            const taskKeyboard = {
-                reply_markup: {
-                    keyboard: [
-                        ['📋 View My Tasks'],
-                        ['📊 Task Status']
-                    ],
-                    resize_keyboard: true,
-                    one_time_keyboard: true
-                }
-            };
-            
-            await bot.sendMessage(
-                chatId,
-                '✅ Account linked successfully!\n\n' +
-                `📧 ERPNext: ${userSession.email}\n` +
-                `📱 Telegram: ${userId}\n\n` +
-                'You will now receive task assignment notifications! 🎯\n\n' +
-                'What would you like to do next?',
-                taskKeyboard
-            );
-            
-        } else if (data === 'start_over') {
-            // Reset user session
-            userSessions[userId] = { 
-                step: 'awaiting_email',
-                telegramId: userId,
-                firstName: userSession.firstName
-            };
-            
-            await bot.editMessageText('🔄 Okay, let\'s start over!\n\nPlease enter your ERPNext email address:', {
-                chat_id: chatId,
-                message_id: callbackQuery.message.message_id
-            });
-        } else if (data.startsWith('view_task_')) {
-            const taskId = data.replace('view_task_', '');
-            // Show task details using the main implementation
-            try {
-                await showTaskDetails(chatId, userSession.email, userSession.cookies, userId, taskId);
-            } catch (error) {
-                console.error('Error showing task details:', error);
-                await bot.sendMessage(chatId, '❌ Failed to load task details. Please try again.');
-            }
-            await bot.answerCallbackQuery(callbackQuery.id);
-            return;
-        } else if (data === 'view_tasks') {
-            // Show user's tasks
-            await showUserTasks(chatId, userSession.email, userSession.cookies, userId);
-            await bot.answerCallbackQuery(callbackQuery.id);
-            return;
-        } else if (data.startsWith('status_')) {
-            const status = data.replace('status_', '');
-            userSession.statusFilter = status === 'All' ? null : status;
-            
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: status === 'All' ? 'Showing all tasks' : `Filtering by status: ${status}`
-            });
-            
-            // Show tasks with the selected status
-            if (userSession.email && userSession.password) {
-                await showUserTasks(chatId, userSession.email, userSession.password, userId);
-            }
-        } else if (data.startsWith('task_')) {
-            // Handle task detail view
-            const taskId = data.replace('task_', '');
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: 'Loading task details...'
-            });
-            
-            if (userSession.email && userSession.password) {
-                await showTaskDetails(chatId, userSession.email, userSession.password, userId, taskId);
-            }
-        } else if (data === 'back_to_tasks') {
-            // Go back to task list
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: 'Returning to task list...'
-            });
-            
-            if (userSession.email && userSession.password) {
-                await showUserTasks(chatId, userSession.email, userSession.password, userId);
-            }
-        } else if (data.startsWith('complete_')) {
-            // Mark task as completed
-            const taskId = data.replace('complete_', '');
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: 'Marking task as completed...'
-            });
-            
-            if (userSession.email && userSession.password) {
-                await updateTaskStatus(chatId, userSession.email, userSession.password, taskId, 'Completed');
-            }
-        } else if (data.startsWith('update_')) {
-            // Show status update options
-            const taskId = data.replace('update_', '');
-            await showStatusUpdateOptions(chatId, userId, taskId);
-        } else if (data.startsWith('set_status_')) {
-            // Set specific status
-            const parts = data.replace('set_status_', '').split('_');
-            const taskId = parts[0];
-            const newStatus = parts[1];
-            
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: `Updating status to ${newStatus}...`
-            });
-            
-            if (userSession.email && userSession.password) {
-                await updateTaskStatus(chatId, userSession.email, userSession.password, taskId, newStatus);
-            }
-        } else if (data.startsWith('attach_')) {
-            // Prepare for file attachment
-            const taskId = data.replace('attach_', '');
-            userSession.pendingTaskIdForAttachment = taskId;
-            
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: 'Ready to receive files. Please send your file or photo now.'
-            });
-            
-            await bot.sendMessage(chatId, 
-                `📎 Ready to attach files to task!\n\n` +
-                `Please send the file or photo you want to attach.\n` +
-                `You can send documents, images, or any other files.\n\n` +
-                `The file will be attached directly to the task in ERPNext.`
-            );
-        } else if (data.startsWith('view_attachments_')) {
-            // View task attachments
-            const taskId = data.replace('view_attachments_', '');
-            await bot.answerCallbackQuery(callbackQuery.id, {
-                text: 'Loading attachments...'
-            });
-            
-            if (userSession.email && userSession.password) {
-                await showTaskAttachments(chatId, userSession.email, userSession.password, userId, taskId);
-            }
-        }
-    } catch (error) {
-        console.error('❌ Error in callback handler:', error);
-        await bot.sendMessage(chatId, '❌ An error occurred: ' + error.message);
-    }
-});
-
-// Show status update options with dynamic status from ERPNext
-async function showStatusUpdateOptions(chatId, userId, taskId) {
-    try {
-        const userSession = userSessions[userId];
-        if (!userSession.email || !userSession.password) {
-            return await bot.sendMessage(chatId, '❌ Please log in again.');
-        }
-
-        // Get current task details to show current status
-        const authResult = await authenticateWithERPNext(userSession.email, userSession.password);
-        if (!authResult.success) {
-            return await bot.sendMessage(chatId, '❌ Authentication failed.');
-        }
-
-        const task = await getTaskDetails(taskId, authResult.cookies);
-        if (!task) {
-            return await bot.sendMessage(chatId, '❌ Task not found.');
-        }
-
-        const currentStatus = task.status || 'Open';
-        
-        // Fetch available status options from ERPNext
-        const allStatusOptions = await getStatusOptions(userSession.email, userSession.password);
-        
-        // Filter out current status and create buttons
-        const availableStatusOptions = allStatusOptions
-            .filter(status => status !== currentStatus)
-            .map(status => ({
-                name: status,
-                icon: getStatusIcon(status)
-            }));
-
-        // Create status buttons
-        const statusButtons = availableStatusOptions.map(status => {
-            return [{
-                text: `${status.icon} ${status.name}`,
-                callback_data: `set_status_${taskId}_${status.name}`
-            }];
-        });
-
-        // Add back button
-        statusButtons.push([
-            { text: '↩️ Back to Task', callback_data: `task_${taskId}` }
-        ]);
-
-        await bot.sendMessage(
-            chatId,
-            `🔄 Update Task Status\n\n` +
-            `Current Status: ${getStatusIcon(currentStatus)} ${currentStatus}\n\n` +
-            `Select new status:`,
-            {
-                reply_markup: {
-                    inline_keyboard: statusButtons
-                }
-            }
-        );
-
-    } catch (error) {
-        console.error('❌ Status options error:', error);
-        await bot.sendMessage(chatId, '❌ Failed to load status options.');
-    }
-}
-
-// Update task status - workaround for server script issues
-async function updateTaskStatus(chatId, email, password, taskId, newStatus) {
-    try {
-        console.log(`🔄 Updating task ${taskId} status to: ${newStatus}`);
-        
-        const authResult = await authenticateWithERPNext(email, password);
-        if (!authResult.success) {
-            return await bot.sendMessage(chatId, '❌ Authentication failed. Please log in again.');
-        }
-
-        // Try Method 1: Use cookies instead of API key (bypasses some server scripts)
-        try {
-            console.log('🔄 Trying Method 1: Using session cookies...');
-            
-            // Get current task data using cookies
-            const taskResponse = await axios.get(
-                `${ERP_URL}/api/resource/Task/${encodeURIComponent(taskId)}`,
-                {
-                    headers: { 
-                        'Cookie': authResult.cookies.join('; ')
-                    },
-                    timeout: 15000
-                }
-            );
-            
-            const taskData = taskResponse.data.data;
-            
-            // Update using the form API endpoint which might bypass server scripts
-            const updateResponse = await axios.post(
-                `${ERP_URL}/api/method/frappe.client.set_value`,
-                {
-                    doctype: 'Task',
-                    name: taskId,
-                    fieldname: 'status',
-                    value: newStatus
-                },
-                {
-                    headers: { 
-                        'Cookie': authResult.cookies.join('; '),
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 15000
-                }
-            );
-
-            console.log('✅ Status updated via frappe.client.set_value');
-            
-            await bot.sendMessage(chatId, 
-                `✅ Task status updated successfully!\n\n` +
-                `🔄 New Status: ${getStatusIcon(newStatus)} ${newStatus}`
-            );
-
-            // Show updated task details
-            await showTaskDetails(chatId, email, password, chatId, taskId);
-            return;
-
-        } catch (method1Error) {
-            console.log('❌ Method 1 failed, trying Method 2...');
-            
-            // Method 2: Try with API key but minimal data
-            const apiKey = process.env.ERPNEXT_API_KEY;
-            const apiSecret = process.env.ERPNEXT_API_SECRET;
-            
-            if (!apiKey || !apiSecret) {
-                throw new Error('API credentials missing');
-            }
-
-            console.log('🔄 Trying Method 2: Using API key with minimal update...');
-            
-            const updateResponse = await axios.post(
-                `${ERP_URL}/api/method/frappe.client.set_value`,
-                {
-                    doctype: 'Task',
-                    name: taskId,
-                    fieldname: 'status',
-                    value: newStatus
-                },
-                {
-                    headers: {
-                        'Authorization': `token ${apiKey}:${apiSecret}`,
-                        'Content-Type': 'application/json'
-                    },
-                    timeout: 15000
-                }
-            );
-
-            console.log('✅ Status updated via API token');
-            
-            await bot.sendMessage(chatId, 
-                `✅ Task status updated successfully!\n\n` +
-                `🔄 New Status: ${getStatusIcon(newStatus)} ${newStatus}`
-            );
-
-            // Show updated task details
-            await showTaskDetails(chatId, email, password, chatId, taskId);
-        }
-
-    } catch (error) {
-        console.error('❌ All update methods failed:', error.message);
-        
-        if (error.response) {
-            console.log('Error response:', error.response.data);
-            
-            // Check if it's the server script error
-            if (error.response.data && error.response.data.exc && error.response.data.exc.includes('__import__ not found')) {
-                await bot.sendMessage(chatId, 
-                    '❌ Cannot update task status due to a system configuration issue.\n\n' +
-                    '⚠️ There is a server script in your ERPNext that is preventing task updates.\n\n' +
-                    'Please contact your system administrator to fix the Server Script that runs on Task updates.'
-                );
-            } else {
-                await bot.sendMessage(chatId, 
-                    `❌ Failed to update task status.\n\n` +
-                    `Error: ${error.response.data.message || error.message}`
-                );
-            }
-        } else {
-            await bot.sendMessage(chatId, 
-                '❌ Failed to update task status. Please try again later.'
-            );
-        }
-    }
-}
-
-// Show task attachments
-async function showTaskAttachments(chatId, email, password, userId, taskId) {
-    try {
-        const authResult = await authenticateWithERPNext(email, password);
-        if (!authResult.success) {
-            return await bot.sendMessage(chatId, '❌ Authentication failed.');
-        }
-
-        const apiKey = process.env.ERPNEXT_API_KEY;
-        const apiSecret = process.env.ERPNEXT_API_SECRET;
-        
-        if (!apiKey || !apiSecret) {
-            return await bot.sendMessage(chatId, '❌ System configuration error.');
-        }
-
-        // Get task attachments from ERPNext
-        const attachmentsResponse = await axios.get(
-            `${ERP_URL}/api/resource/File?fields=["name","file_name","file_url","file_size","modified"]&filters=[["attached_to_name","=","${taskId}"],["attached_to_doctype","=","Task"]]&order_by=modified desc`,
-            {
-                headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
-                timeout: 10000
-            }
-        );
-
-        const attachments = attachmentsResponse.data.data || [];
-        
-        if (attachments.length === 0) {
-            return await bot.sendMessage(chatId, 
-                `📎 No attachments found for this task.\n\n` +
-                `Use the "Attach File" button to add files.`
-            );
-        }
-
-        let message = `📎 Attachments (${attachments.length})\n\n`;
-        
-        attachments.forEach((attachment, index) => {
-            const fileSize = attachment.file_size ? `(${formatFileSize(attachment.file_size)})` : '';
-            message += `${index + 1}. ${attachment.file_name} ${fileSize}\n`;
-        });
-
-        const attachmentButtons = {
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        { text: '📎 Attach More Files', callback_data: `attach_${taskId}` }
-                    ],
-                    [
-                        { text: '📋 Back to Task', callback_data: `task_${taskId}` }
-                    ]
-                ]
-            }
-        };
-
-        await bot.sendMessage(chatId, message, attachmentButtons);
-
-    } catch (error) {
-        console.error('❌ Attachments error:', error);
-        await bot.sendMessage(chatId, '❌ Failed to load attachments.');
-    }
-}
-
-// Format file size
-function formatFileSize(bytes) {
-    if (!bytes) return '';
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
-}
-
-
-// Global variables (persist between function calls)
-global.userSessions = global.userSessions || {};
-global.statusOptionsCache = global.statusOptionsCache || {};
-global.bot = global.bot || null;
-
-// Initialize bot once
-function initializeBot() {
-  if (global.bot) return global.bot;
-
-  console.log('🔧 Starting Telegram Bot...');
-  console.log('📋 Checking environment...');
-  console.log('ERP_URL:', process.env.ERP_URL);
-  console.log('BOT_TOKEN exists:', !!process.env.TELEGRAM_BOT_TOKEN);
-
-  if (!process.env.TELEGRAM_BOT_TOKEN) {
-    throw new Error('❌ TELEGRAM_BOT_TOKEN is missing');
-  }
-
-  if (!process.env.ERP_URL) {
-    throw new Error('❌ ERP_URL is missing');
-  }
-
-  const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { 
-    polling: false // Disable polling for serverless
-  });
-
-  setupBotHandlers(bot);
-  global.bot = bot;
-  
-  console.log('🤖 Bot initialized successfully');
-  return bot;
-}
-
-// Setup bot handlers
-function setupBotHandlers(bot) {
-  const ERP_URL = process.env.ERP_URL;
-
-  // Handle /start command
-  bot.onText(/\/start/, async (msg) => {
-    console.log('🔄 /start command received from:', msg.from.id);
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    
-    // Initialize user session
-    global.userSessions[userId] = { 
-      step: 'awaiting_email',
-      telegramId: userId,
-      firstName: msg.from.first_name || 'User'
-    };
-
-    try {
-      await bot.sendMessage(chatId, 
-        `👋 Welcome ${msg.from.first_name || 'there'} to ERPNext Task Bot!\n\n` +
-        `To get started, I'll need to link your ERPNext account.\n` +
-        `Please enter your ERPNext email address:`
-      );
-      console.log('✅ Welcome message sent to:', userId);
-    } catch (error) {
-      console.error('❌ Error sending welcome message:', error);
-    }
-  });
-
-  // Handle text messages
-  bot.on('message', async (msg) => {
-    // Skip if message is a command or empty
-    if (!msg.text) return;
-    
-    console.log('📨 Message received:', msg.text, 'from:', msg.from.id);
-    
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const text = msg.text.trim();
-
-    // Handle menu buttons
-    if (text === '📋 View My Tasks' || text === '/tasks') {
-      if (!global.userSessions[userId] || !global.userSessions[userId].email) {
-        return await bot.sendMessage(chatId, 'Please log in first using /start');
-      }
-      const userSession = global.userSessions[userId];
-      await showUserTasks(chatId, userSession.email, userSession.password, userId);
-      return;
-    } else if (text === '📊 Task Status' || text === '/status') {
-      const statusKeyboard = {
-        reply_markup: {
-          inline_keyboard: [
-            [
-              { text: '🔵 Open', callback_data: 'status_Open' },
-              { text: '🟡 Working', callback_data: 'status_Working' }
-            ],
-            [
-              { text: '✅ Completed', callback_data: 'status_Completed' },
-              { text: '❌ Cancelled', callback_data: 'status_Cancelled' },
-              { text: '👀 All', callback_data: 'status_All' }
-            ]
-          ]
-        }
-      };
-      await bot.sendMessage(chatId, '🔍 Select task status to filter:', statusKeyboard);
-      return;
-    }
-
-    // Skip if it's a command
-    if (text.startsWith('/')) return;
-
-    // Initialize session if it doesn't exist
-    if (!global.userSessions[userId]) {
-      console.log('ℹ️ Initializing new session for user:', userId);
-      global.userSessions[userId] = { 
-        step: 'awaiting_email',
-        telegramId: userId,
-        firstName: msg.from.first_name || 'User'
-      };
-    }
-
-    const userSession = global.userSessions[userId];
-    console.log('🔄 Processing step:', userSession.step, 'for user:', userId);
-
-    try {
-      switch (userSession.step) {
-        case 'awaiting_email':
-          // Basic email validation
-          if (!text.includes('@') || !text.includes('.')) {
-            await bot.sendMessage(chatId, '❌ Please enter a valid email address:');
-            return;
-          }
-          
-          userSession.email = text;
-          userSession.step = 'awaiting_password';
-          await bot.sendMessage(chatId, '🔑 Great! Now, please enter your ERPNext password:');
-          break;
-
-        case 'awaiting_password':
-          userSession.password = text;
-          userSession.step = 'confirm_login';
-          
-          // Create login button
-          const loginKeyboard = {
-            reply_markup: {
-              inline_keyboard: [
-                [{ text: '✅ Login to ERPNext', callback_data: 'confirm_login' }],
-                [{ text: '↩️ Start Over', callback_data: 'start_over' }]
-              ]
-            }
-          };
-          
-          await bot.sendMessage(
-            chatId,
-            `🔐 Ready to link your account?\n\n` +
-            `Email: ${userSession.email}\n` +
-            `Click the button below to confirm and link your account.`,
-            loginKeyboard
-          );
-          break;
-          
-        default:
-          // If we're in a different state, show the task management buttons
-          const taskKeyboard = {
-            reply_markup: {
-              keyboard: [
-                ['📋 View My Tasks'],
-                ['📊 Task Status']
-              ],
-              resize_keyboard: true
-            }
-          };
-          await bot.sendMessage(chatId, 'What would you like to do next?', taskKeyboard);
-      }
-    } catch (error) {
-      console.error('❌ Error in message handler:', error);
-      await bot.sendMessage(chatId, '❌ An error occurred. Please try /start again.');
-      delete global.userSessions[userId];
-    }
-  });
-
-  // Handle callback queries (for login button and task actions)
-  bot.on('callback_query', async (callbackQuery) => {
-    const chatId = callbackQuery.message.chat.id;
-    const userId = callbackQuery.from.id;
-    const data = callbackQuery.data;
-    
-    await bot.answerCallbackQuery(callbackQuery.id);
-    
-    if (!global.userSessions[userId]) {
-      return await bot.sendMessage(chatId, '❌ Session expired. Please /start again.');
-    }
-    
-    const userSession = global.userSessions[userId];
-    
-    try {
-      if (data === 'confirm_login') {
-        if (!userSession.email || !userSession.password) {
-          throw new Error('Missing credentials');
-        }
-        
-        await bot.editMessageText('🔗 Linking your account... Please wait...', {
-          chat_id: chatId,
-          message_id: callbackQuery.message.message_id
-        });
-        
-        // Call the link account function
-        await linkTelegramAccount(chatId, userSession.email, userSession.password, userId);
-        
-        // Show task management buttons after successful login
-        const taskKeyboard = {
-          reply_markup: {
-            keyboard: [
-              ['📋 View My Tasks'],
-              ['📊 Task Status']
-            ],
-            resize_keyboard: true,
-            one_time_keyboard: true
-          }
-        };
-        
-        await bot.sendMessage(
-          chatId,
-          '✅ Account linked successfully!\n\n' +
-          `📧 ERPNext: ${userSession.email}\n` +
-          `📱 Telegram: ${userId}\n\n` +
-          'You will now receive task assignment notifications! 🎯\n\n' +
-          'What would you like to do next?',
-          taskKeyboard
-        );
-        
-      } else if (data === 'start_over') {
-        // Reset user session
-        global.userSessions[userId] = { 
-          step: 'awaiting_email',
-          telegramId: userId,
-          firstName: userSession.firstName
-        };
-        
-        await bot.editMessageText('🔄 Okay, let\'s start over!\n\nPlease enter your ERPNext email address:', {
-          chat_id: chatId,
-          message_id: callbackQuery.message.message_id
-        });
-      } else if (data.startsWith('status_')) {
-        const status = data.replace('status_', '');
-        userSession.statusFilter = status === 'All' ? null : status;
-        
-        await bot.answerCallbackQuery(callbackQuery.id, {
-          text: status === 'All' ? 'Showing all tasks' : `Filtering by status: ${status}`
-        });
-        
-        // Show tasks with the selected status
-        if (userSession.email && userSession.password) {
-          await showUserTasks(chatId, userSession.email, userSession.password, userId);
-        }
-      } else if (data.startsWith('task_')) {
-        // Handle task detail view
-        const taskId = data.replace('task_', '');
-        await bot.answerCallbackQuery(callbackQuery.id, {
-          text: 'Loading task details...'
-        });
-        
-        if (userSession.email && userSession.password) {
-          await showTaskDetails(chatId, userSession.email, userSession.password, userId, taskId);
-        }
-      } else if (data === 'back_to_tasks') {
-        // Go back to task list
-        await bot.answerCallbackQuery(callbackQuery.id, {
-          text: 'Returning to task list...'
-        });
-        
-        if (userSession.email && userSession.password) {
-          await showUserTasks(chatId, userSession.email, userSession.password, userId);
-        }
-      }
-    } catch (error) {
-      console.error('❌ Error in callback handler:', error);
-      await bot.sendMessage(chatId, '❌ An error occurred: ' + error.message);
-    }
-  });
-}
-
-// Vercel serverless function handler
-module.exports = async (req, res) => {
-  // Set CORS headers
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
-
-  // Handle preflight requests
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
-
-  try {
-    // Initialize bot
-    const bot = initializeBot();
-    
-    // Handle webhook updates from Telegram
-    if (req.method === 'POST' && req.body) {
-      console.log('📨 Received webhook update from Telegram');
-      await bot.processUpdate(req.body);
-      res.status(200).json({ status: 'ok', message: 'Update processed' });
-    } else {
-      // GET request - show status
-      res.status(200).json({ 
-        status: 'Bot is running',
-        message: 'Send POST requests with Telegram webhook updates',
-        url: 'https://erpnext-telegram-g7cy22pt4-mastewals-projects-c001046f.vercel.app/api/telegram-link'
-      });
-    }
-  } catch (error) {
-    console.error('❌ Serverless function error:', error);
-    res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message 
-    });
-  }
-};
-
-
 // Show tasks to user with proper field mappings
 async function showUserTasks(chatId, email, password, telegramUserId) {
     try {
@@ -1674,57 +1038,57 @@ async function showTaskDetails(chatId, email, password, telegramUserId, taskId) 
         // Get attachments count
         const attachmentsCount = await getAttachmentsCount(email, password, taskId);
 
-        // Format task details message
-        const statusIcon = getStatusIcon(task.status);
-        let message = `📋 *Task Details*\n\n`;
-        message += `*${statusIcon} ${task.subject || 'Untitled Task'}*\n\n`;
+        // Format task details message with HTML formatting
+        const statusIcon = getStatusIcon(task.status || 'Open');
         
-        // Basic task information
-        message += `*Status:* ${task.status || 'Open'}\n`;
-        message += `*Priority:* ${task.priority || 'Medium'}\n`;
+        let message = `<b>📋 Task Details</b>\n\n`;
+        message += `<b>${statusIcon} ${task.subject || 'Untitled Task'}</b>\n\n`;
         
-        if (task.project) {
-            message += `*Project:* ${task.project}\n`;
-        }
+        // Task information in a clean format
+        message += `<b>Status:</b> ${task.status || 'Open'}\n`;
+        message += `<b>Priority:</b> ${task.priority || 'Medium'}\n`;
+        message += `<b>Project:</b> ${task.project || 'Not specified'}\n`;
+        message += `<b>Type:</b> ${task.type || 'Task'}\n`;
+        message += `<b>Department:</b> ${task.department || 'Not specified'}\n\n`;
         
-        if (task.type) {
-            message += `*Type:* ${task.type}\n`;
-        }
-        
-        if (task.department) {
-            message += `*Department:* ${task.department}\n`;
-        }
-        
-        if (task.exp_start_date) {
-            message += `*Start Date:* ${formatDate(task.exp_start_date)}\n`;
-        }
-        
-        if (task.exp_end_date) {
-            message += `*End Date:* ${formatDate(task.exp_end_date)}\n`;
-        }
-        
-        if (task.progress) {
-            message += `*Progress:* ${task.progress}%\n`;
-        }
-
-        // Attachments section
-        message += `\n*Attachments:* ${attachmentsCount} file(s)\n`;
-        
-        // Task description
-        if (task.description) {
-            const cleanDescription = task.description.replace(/<[^>]*>/g, '').trim();
-            if (cleanDescription.length > 0) {
-                message += `\n*Description:*\n${cleanDescription.substring(0, 500)}`;
-                if (cleanDescription.length > 500) {
-                    message += `...\n*(truncated)*`;
-                }
+        // Dates
+        if (task.exp_start_date || task.exp_end_date) {
+            message += `<b>📅 Timeline:</b>\n`;
+            if (task.exp_start_date) {
+                message += `• Start: ${formatDate(task.exp_start_date)}\n`;
             }
+            if (task.exp_end_date) {
+                message += `• Due: ${formatDate(task.exp_end_date)}\n`;
+            }
+            message += '\n';
+        }
+        
+        // Description
+        if (task.description) {
+            // Clean up HTML tags from description
+            const cleanDescription = task.description
+                .replace(/<[^>]*>?/gm, '') // Remove HTML tags
+                .replace(/\n{3,}/g, '\n\n') // Remove excessive newlines
+                .trim();
+                
+            message += `<b>📝 Description:</b>\n${cleanDescription}\n\n`;
         }
         
         // Additional metadata
-        message += `\n\n*Created:* ${formatDate(task.creation)}\n`;
-        message += `*Modified:* ${formatDate(task.modified)}\n`;
+        const additionalInfo = [];
+        if (task.owner) additionalInfo.push(`<b>Created by:</b> ${task.owner}`);
+        if (task.modified_by) additionalInfo.push(`<b>Modified by:</b> ${task.modified_by}`);
+        
+        if (additionalInfo.length > 0) {
+            message += additionalInfo.join(' | ') + '\n\n';
+        }
 
+        // Attachments section
+        message += `<b>📎 Attachments:</b> ${attachmentsCount} file(s)\n\n`;
+
+        // Add direct web link to the task
+        const webLink = `${ERP_URL}/app/task/${taskId}`;
+        
         // Action buttons - Show "Submit" instead of "Mark Complete" if task is completed
         const isCompleted = task.status === 'Completed';
         const completeButtonText = isCompleted ? '✅ Submitted' : '✅ Mark Complete';
@@ -1746,14 +1110,25 @@ async function showTaskDetails(chatId, email, password, telegramUserId, taskId) 
                         { text: `📁 View Attachments (${attachmentsCount})`, callback_data: `view_attachments_${taskId}` }
                     ],
                     [
+                        { 
+                            text: '🌐 View in Web', 
+                            url: webLink,
+                            callback_data: 'no_action'
+                        }
+                    ],
+                    [
                         { text: '📋 Back to Tasks', callback_data: 'back_to_tasks' }
                     ]
                 ]
             }
         };
 
-        await bot.sendMessage(chatId, message, {
-            parse_mode: 'Markdown',
+        // Add web link to the message
+        const messageWithLink = `${message}\n\n🌐 <a href="${webLink}">Open in Web Browser</a>\n`;
+
+        await bot.sendMessage(chatId, messageWithLink, {
+            parse_mode: 'HTML',
+            disable_web_page_preview: true,
             reply_markup: actionButtons.reply_markup
         });
 
@@ -1984,50 +1359,27 @@ async function linkTelegramAccount(chatId, email, password, telegramUserId) {
 
         console.log('✅ Account linked for:', email);
 
-        // Initialize WebSocket connection
-        try {
-            const WebSocketHandler = require('./websocket-handler');
-            
-            // Get or create WebSocket handler instance
-            const wsHandler = new WebSocketHandler(bot);
-            
-            // Add user to WebSocket handler with session data
-            await wsHandler.ensureConnection();
-            
-            // Add user to connected users map
-            wsHandler.addUser(email, chatId, {
-                email: email,
-                telegramId: telegramUserId,
-                chatId: chatId,
-                cookies: authResult.cookies,
-                apiKey: process.env.ERPNEXT_API_KEY,
-                apiSecret: process.env.ERPNEXT_API_SECRET
-            });
-            
-            console.log(`✅ WebSocket connection initialized for ${email}`);
-            await bot.sendMessage(chatId, 
-                '🔔 *Connected to ERPNext!*\n\n' +
-                'You will now receive real-time task notifications. Here\'s what you can do:\n\n' +
-                '• View your tasks with /mytasks\n' +
-                '• Get task updates automatically\n' +
-                '• Receive notifications for new assignments\n\n' +
-                'Type /help anytime to see available commands.',
-                { parse_mode: 'Markdown' }
-            );
-            
-            // Subscribe to task updates
-            await wsHandler.subscribeToTaskUpdates();
-            
-        } catch (wsError) {
-            console.error('❌ WebSocket initialization error:', wsError);
-            await bot.sendMessage(chatId, 
-                '⚠️ *Connection Warning*\n\n' +
-                'Real-time notifications might not work properly. ' +
-                'The bot will still function, but you might need to refresh manually to see updates.\n\n' +
-                'Error: ' + (wsError.message || 'Unknown error'),
-                { parse_mode: 'Markdown' }
-            );
-        }
+        await bot.sendMessage(chatId, 
+            '✅ *Account Linked Successfully!*\n\n' +
+            `📧 ERPNext: ${email}\n` +
+            `📱 Telegram: ${telegramUserId}\n\n` +
+            'You can now:\n' +
+            '• View your tasks with "View My Tasks"\n' +
+            '• Receive task notifications\n' +
+            '• Update task status\n' +
+            '• Attach files to tasks\n\n' +
+            'What would you like to do next?',
+            { 
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    keyboard: [
+                        ['📋 View My Tasks'],
+                        ['📊 Task Status']
+                    ],
+                    resize_keyboard: true
+                }
+            }
+        );
 
     } catch (error) {
         console.error('❌ Linking error:', error);
@@ -2117,6 +1469,338 @@ function getStatusIcon(status) {
     return icons[status] || '📋';
 }
 
+// Show status update options with dynamic status from ERPNext
+async function showStatusUpdateOptions(chatId, userId, taskId) {
+    try {
+        const userSession = userSessions[userId];
+        if (!userSession.email || !userSession.password) {
+            return await bot.sendMessage(chatId, '❌ Please log in again.');
+        }
+
+        // Get current task details to show current status
+        const authResult = await authenticateWithERPNext(userSession.email, userSession.password);
+        if (!authResult.success) {
+            return await bot.sendMessage(chatId, '❌ Authentication failed.');
+        }
+
+        const task = await getTaskDetails(taskId, authResult.cookies);
+        if (!task) {
+            return await bot.sendMessage(chatId, '❌ Task not found.');
+        }
+
+        const currentStatus = task.status || 'Open';
+        
+        // Fetch available status options from ERPNext
+        const allStatusOptions = await getStatusOptions(userSession.email, userSession.password);
+        
+        // Filter out current status and create buttons
+        const availableStatusOptions = allStatusOptions
+            .filter(status => status !== currentStatus)
+            .map(status => ({
+                name: status,
+                icon: getStatusIcon(status)
+            }));
+
+        // Create status buttons
+        const statusButtons = availableStatusOptions.map(status => {
+            return [{
+                text: `${status.icon} ${status.name}`,
+                callback_data: `set_status_${taskId}_${status.name}`
+            }];
+        });
+
+        // Add back button
+        statusButtons.push([
+            { text: '↩️ Back to Task', callback_data: `task_${taskId}` }
+        ]);
+
+        await bot.sendMessage(
+            chatId,
+            `🔄 Update Task Status\n\n` +
+            `Current Status: ${getStatusIcon(currentStatus)} ${currentStatus}\n\n` +
+            `Select new status:`,
+            {
+                reply_markup: {
+                    inline_keyboard: statusButtons
+                }
+            }
+        );
+
+    } catch (error) {
+        console.error('❌ Status options error:', error);
+        await bot.sendMessage(chatId, '❌ Failed to load status options.');
+    }
+}
+
+// Fetch status options from ERPNext
+async function fetchStatusOptionsFromERPNext(email, password) {
+    try {
+        console.log('🔄 Fetching status options from ERPNext...');
+        
+        const authResult = await authenticateWithERPNext(email, password);
+        if (!authResult.success) {
+            throw new Error('Authentication failed');
+        }
+
+        const apiKey = process.env.ERPNEXT_API_KEY;
+        const apiSecret = process.env.ERPNEXT_API_SECRET;
+        
+        if (!apiKey || !apiSecret) {
+            throw new Error('API credentials missing');
+        }
+
+        // Method 1: Try to get status options from Task doctype
+        try {
+            const response = await axios.get(
+                `${ERP_URL}/api/resource/DocType/Task`,
+                {
+                    headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
+                    timeout: 10000
+                }
+            );
+
+            const taskDocType = response.data.data;
+            
+            // Extract status options from the Select field
+            if (taskDocType && taskDocType.fields) {
+                const statusField = taskDocType.fields.find(field => field.fieldname === 'status');
+                if (statusField && statusField.options) {
+                    const statusOptions = statusField.options.split('\n').filter(option => option.trim() !== '');
+                    console.log('✅ Status options fetched from Task doctype:', statusOptions);
+                    return statusOptions;
+                }
+            }
+        } catch (error) {
+            console.log('⚠️ Could not fetch from Task doctype, trying alternative method...');
+        }
+
+        // Method 3: Fallback to common status options
+        console.log('🔄 Using fallback status options');
+        return ['Open', 'Working', 'Pending Review', 'Completed', 'Cancelled', 'On Hold', 'Overdue', 'Closed'];
+
+    } catch (error) {
+        console.error('❌ Error fetching status options:', error);
+        // Return default options as fallback
+        return ['Open', 'Working', 'Pending Review', 'Completed', 'Cancelled', 'On Hold', 'Overdue', 'Closed'];
+    }
+}
+
+// Get status options with caching
+async function getStatusOptions(email, password) {
+    const cacheKey = `${email}_status_options`;
+    
+    // Check cache
+    if (statusOptionsCache[cacheKey] && 
+        Date.now() - statusOptionsCache[cacheKey].timestamp < CACHE_DURATION) {
+        console.log('📦 Using cached status options');
+        return statusOptionsCache[cacheKey].options;
+    }
+    
+    // Fetch fresh options
+    const options = await fetchStatusOptionsFromERPNext(email, password);
+    
+    // Update cache
+    statusOptionsCache[cacheKey] = {
+        options: options,
+        timestamp: Date.now()
+    };
+    
+    return options;
+}
+
+// Update task status - workaround for server script issues
+async function updateTaskStatus(chatId, email, password, taskId, newStatus) {
+    try {
+        console.log(`🔄 Updating task ${taskId} status to: ${newStatus}`);
+        
+        const authResult = await authenticateWithERPNext(email, password);
+        if (!authResult.success) {
+            return await bot.sendMessage(chatId, '❌ Authentication failed. Please log in again.');
+        }
+
+        // Try Method 1: Use cookies instead of API key (bypasses some server scripts)
+        try {
+            console.log('🔄 Trying Method 1: Using session cookies...');
+            
+            // Get current task data using cookies
+            const taskResponse = await axios.get(
+                `${ERP_URL}/api/resource/Task/${encodeURIComponent(taskId)}`,
+                {
+                    headers: { 
+                        'Cookie': authResult.cookies.join('; ')
+                    },
+                    timeout: 15000
+                }
+            );
+            
+            const taskData = taskResponse.data.data;
+            
+            // Update using the form API endpoint which might bypass server scripts
+            const updateResponse = await axios.post(
+                `${ERP_URL}/api/method/frappe.client.set_value`,
+                {
+                    doctype: 'Task',
+                    name: taskId,
+                    fieldname: 'status',
+                    value: newStatus
+                },
+                {
+                    headers: { 
+                        'Cookie': authResult.cookies.join('; '),
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 15000
+                }
+            );
+
+            console.log('✅ Status updated via frappe.client.set_value');
+            
+            await bot.sendMessage(chatId, 
+                `✅ Task status updated successfully!\n\n` +
+                `🔄 New Status: ${getStatusIcon(newStatus)} ${newStatus}`
+            );
+
+            // Show updated task details
+            await showTaskDetails(chatId, email, password, chatId, taskId);
+            return;
+
+        } catch (method1Error) {
+            console.log('❌ Method 1 failed, trying Method 2...');
+            
+            // Method 2: Try with API key but minimal data
+            const apiKey = process.env.ERPNEXT_API_KEY;
+            const apiSecret = process.env.ERPNEXT_API_SECRET;
+            
+            if (!apiKey || !apiSecret) {
+                throw new Error('API credentials missing');
+            }
+
+            console.log('🔄 Trying Method 2: Using API key with minimal update...');
+            
+            const updateResponse = await axios.post(
+                `${ERP_URL}/api/method/frappe.client.set_value`,
+                {
+                    doctype: 'Task',
+                    name: taskId,
+                    fieldname: 'status',
+                    value: newStatus
+                },
+                {
+                    headers: {
+                        'Authorization': `token ${apiKey}:${apiSecret}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 15000
+                }
+            );
+
+            console.log('✅ Status updated via API token');
+            
+            await bot.sendMessage(chatId, 
+                `✅ Task status updated successfully!\n\n` +
+                `🔄 New Status: ${getStatusIcon(newStatus)} ${newStatus}`
+            );
+
+            // Show updated task details
+            await showTaskDetails(chatId, email, password, chatId, taskId);
+        }
+
+    } catch (error) {
+        console.error('❌ All update methods failed:', error.message);
+        
+        if (error.response) {
+            console.log('Error response:', error.response.data);
+            
+            // Check if it's the server script error
+            if (error.response.data && error.response.data.exc && error.response.data.exc.includes('__import__ not found')) {
+                await bot.sendMessage(chatId, 
+                    '❌ Cannot update task status due to a system configuration issue.\n\n' +
+                    '⚠️ There is a server script in your ERPNext that is preventing task updates.\n\n' +
+                    'Please contact your system administrator to fix the Server Script that runs on Task updates.'
+                );
+            } else {
+                await bot.sendMessage(chatId, 
+                    `❌ Failed to update task status.\n\n` +
+                    `Error: ${error.response.data.message || error.message}`
+                );
+            }
+        } else {
+            await bot.sendMessage(chatId, 
+                '❌ Failed to update task status. Please try again later.'
+            );
+        }
+    }
+}
+
+// Show task attachments
+async function showTaskAttachments(chatId, email, password, userId, taskId) {
+    try {
+        const authResult = await authenticateWithERPNext(email, password);
+        if (!authResult.success) {
+            return await bot.sendMessage(chatId, '❌ Authentication failed.');
+        }
+
+        const apiKey = process.env.ERPNEXT_API_KEY;
+        const apiSecret = process.env.ERPNEXT_API_SECRET;
+        
+        if (!apiKey || !apiSecret) {
+            return await bot.sendMessage(chatId, '❌ System configuration error.');
+        }
+
+        // Get task attachments from ERPNext
+        const attachmentsResponse = await axios.get(
+            `${ERP_URL}/api/resource/File?fields=["name","file_name","file_url","file_size","modified"]&filters=[["attached_to_name","=","${taskId}"],["attached_to_doctype","=","Task"]]&order_by=modified desc`,
+            {
+                headers: { 'Authorization': `token ${apiKey}:${apiSecret}` },
+                timeout: 10000
+            }
+        );
+
+        const attachments = attachmentsResponse.data.data || [];
+        
+        if (attachments.length === 0) {
+            return await bot.sendMessage(chatId, 
+                `📎 No attachments found for this task.\n\n` +
+                `Use the "Attach File" button to add files.`
+            );
+        }
+
+        let message = `📎 Attachments (${attachments.length})\n\n`;
+        
+        attachments.forEach((attachment, index) => {
+            const fileSize = attachment.file_size ? `(${formatFileSize(attachment.file_size)})` : '';
+            message += `${index + 1}. ${attachment.file_name} ${fileSize}\n`;
+        });
+
+        const attachmentButtons = {
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: '📎 Attach More Files', callback_data: `attach_${taskId}` }
+                    ],
+                    [
+                        { text: '📋 Back to Task', callback_data: `task_${taskId}` }
+                    ]
+                ]
+            }
+        };
+
+        await bot.sendMessage(chatId, message, attachmentButtons);
+
+    } catch (error) {
+        console.error('❌ Attachments error:', error);
+        await bot.sendMessage(chatId, '❌ Failed to load attachments.');
+    }
+}
+
+// Format file size
+function formatFileSize(bytes) {
+    if (!bytes) return '';
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return Math.round(bytes / Math.pow(1024, i) * 100) / 100 + ' ' + sizes[i];
+}
+
 // Error handlers
 bot.on('error', (error) => {
     console.error('❌ Bot error:', error);
@@ -2129,6 +1813,40 @@ bot.on('polling_error', (error) => {
 console.log('🚀 Telegram Bot is now running and listening for messages...');
 console.log('💡 Send /start to your bot to test it');
 
-// Return success response
+// Vercel serverless function handler
+module.exports = async (req, res) => {
+    // Set CORS headers
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
 
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
 
+    try {
+        // Handle webhook updates from Telegram
+        if (req.method === 'POST' && req.body) {
+            console.log('📨 Received webhook update from Telegram');
+            await bot.processUpdate(req.body);
+            res.status(200).json({ status: 'ok', message: 'Update processed' });
+        } else {
+            // GET request - show status
+            res.status(200).json({ 
+                status: 'Bot is running',
+                message: 'Send POST requests with Telegram webhook updates',
+                active_users: Object.keys(userSessions).length,
+                url: 'https://erpnext-telegram-g7cy22pt4-mastewals-projects-c001046f.vercel.app/api/telegram-link'
+            });
+        }
+    } catch (error) {
+        console.error('❌ Serverless function error:', error);
+        res.status(500).json({ 
+            error: 'Internal server error',
+            message: error.message 
+        });
+    }
+};
