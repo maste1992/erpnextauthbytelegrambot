@@ -1076,7 +1076,12 @@ async function showTaskDetails(chatId, email, password, telegramUserId, taskId) 
         
         // Additional metadata
         const additionalInfo = [];
-        if (task.owner) additionalInfo.push(`<b>Created by:</b> ${task.owner}`);
+        if (task.owner) {
+            const ownerName = task.owner_full_name || 
+                            (typeof task.owner === 'object' ? task.owner.full_name : task.owner) || 
+                            'System';
+            additionalInfo.push(`<b>Allocated by:</b> ${ownerName}`);
+        }
         if (task.modified_by) additionalInfo.push(`<b>Modified by:</b> ${task.modified_by}`);
         
         if (additionalInfo.length > 0) {
@@ -1170,9 +1175,9 @@ async function getTaskDetails(taskId, cookies) {
     try {
         console.log('🔍 Fetching details for task:', taskId);
         
-        // Fetch task details from ERPNext API
+        // Fetch task details from ERPNext API with owner information
         const response = await axios.get(
-            `${ERP_URL}/api/resource/Task/${encodeURIComponent(taskId)}`,
+            `${ERP_URL}/api/resource/Task/${encodeURIComponent(taskId)}?fields=["*","owner.full_name"]`,
             {
                 headers: { 
                     'Cookie': cookies.join('; ')
@@ -1181,8 +1186,28 @@ async function getTaskDetails(taskId, cookies) {
             }
         );
         
+        const taskData = response.data.data;
+        
+        // If owner is a user ID, try to get the full name
+        if (taskData.owner && typeof taskData.owner === 'string' && taskData.owner.includes('@')) {
+            try {
+                const userResponse = await axios.get(
+                    `${ERP_URL}/api/resource/User/${encodeURIComponent(taskData.owner)}?fields=["full_name"]`,
+                    {
+                        headers: { 
+                            'Cookie': cookies.join('; ')
+                        },
+                        timeout: 8000
+                    }
+                );
+                taskData.owner = userResponse.data.data.full_name || taskData.owner;
+            } catch (userError) {
+                console.log('Could not fetch user details, using owner ID:', taskData.owner);
+            }
+        }
+        
         console.log('✅ Task details fetched successfully');
-        return response.data.data;
+        return taskData;
         
     } catch (error) {
         console.error('❌ Task details fetch error:', error.message);
