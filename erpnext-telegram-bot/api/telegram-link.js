@@ -731,8 +731,8 @@ async function sendTaskAssignmentNotification(userId, taskDetails) {
                 inline_keyboard: [
                     [{ text: '📋 View Task Details', callback_data: `view_task_${taskDetails.name}` }],
                     [
-                        { text: '✅ Mark as Done', callback_data: `status_${taskDetails.name}_Completed` },
-                        { text: '📅 Set Reminder', callback_data: `remind_${taskDetails.name}` }
+                        // { text: '✅ Mark as Done', callback_data: `status_${taskDetails.name}_Completed` },
+                        // { text: '📅 Set Reminder', callback_data: `remind_${taskDetails.name}` }
                     ]
                 ]
             }
