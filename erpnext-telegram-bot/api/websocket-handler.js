@@ -2,6 +2,38 @@ const WebSocket = require('ws');
 const axios = require('axios');
 const { ERP_URL } = require('./config');
 
+/**
+ * Sends a formatted notification to a user
+ * @param {Object} user - User object containing chatId and other user data
+ * @param {Object} notification - Notification data
+ * @param {string} notification.owner - Who allocated/created the notification
+ * @param {string} notification.reference_type - Type of the reference
+ * @param {string} notification.description - Description of the notification
+ */
+async function sendFormattedNotification(user, notification) {
+    try {
+        const { chatId } = user;
+        const { owner, reference_type, description } = notification;
+        
+        const message = `
+<b>New Notification Arrived! 🔔</b>
+
+<u>Notification Details:</u>
+  • <b>Allocated by</b>: ${owner || 'System'}
+  • <b>Reference Type</b>: ${reference_type || 'N/A'}
+  • <b>Description</b>: ${description || 'No description provided'}
+
+<em>Tibeb Design & Build ERP</em>
+`;
+
+        await this.bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
+        console.log(`📨 Sent formatted notification to user ${chatId}`);
+    } catch (error) {
+        console.error('❌ Error sending formatted notification:', error);
+        throw error;
+    }
+}
+
 let instance = null;
 
 class WebSocketHandler {
@@ -16,8 +48,58 @@ class WebSocketHandler {
             this.isConnecting = false;
             this.reconnectTimeout = null;
             instance = this;
+            
+            // Bind the sendFormattedNotification method to the instance
+            this.sendFormattedNotification = sendFormattedNotification.bind(this);
         }
         return instance;
+    }
+
+    /**
+     * Sends a notification to a specific user
+     * @param {string} email - User's email
+     * @param {Object} notification - Notification data
+     */
+    async sendUserNotification(email, notification) {
+        try {
+            const user = this.connectedUsers.get(email);
+            if (!user) {
+                console.log(`User ${email} not found in connected users`);
+                return false;
+            }
+            
+            // Check if user has notifications enabled
+            if (user.sessionData.notificationsEnabled !== false) {
+                await this.sendFormattedNotification(user, notification);
+                return true;
+            }
+            return false;
+        } catch (error) {
+            console.error(`Error sending notification to ${email}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Broadcasts a notification to all connected users
+     * @param {Object} notification - Notification data
+     * @param {Array} [excludeEmails=[]] - Array of emails to exclude
+     */
+    async broadcastNotification(notification, excludeEmails = []) {
+        try {
+            let sentCount = 0;
+            for (const [email, user] of this.connectedUsers.entries()) {
+                if (!excludeEmails.includes(email)) {
+                    const sent = await this.sendUserNotification(email, notification);
+                    if (sent) sentCount++;
+                }
+            }
+            console.log(`📢 Broadcasted notification to ${sentCount} users`);
+            return sentCount;
+        } catch (error) {
+            console.error('Error broadcasting notification:', error);
+            throw error;
+        }
     }
 
     // Add or update user in connected users

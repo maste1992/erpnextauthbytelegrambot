@@ -53,51 +53,55 @@ bot.onText(/\/start/, async (msg) => {
     console.log('🔄 /start command received from:', msg.from.id);
     const chatId = msg.chat.id;
     const userId = msg.from.id;
-    const userSession = userSessions[userId];
+    const userSession = userSessions[userId] || {};
     
-    // Check if user is already logged in
-    if (userSession && userSession.isLoggedIn) {
-        await bot.sendMessage(chatId, 
-            `👋 Welcome back, ${userSession.firstName || 'User'}!\n` +
-            `You are already logged in.\n\n` +
-            `What would you like to do next?`,
-            {
-                reply_markup: {
-                    keyboard: [
-                        ['📋 View My Tasks'],
-                        ['📊 Task Status']
-                    ],
-                    resize_keyboard: true
-                }
-            }
-        );
-        return;
-    }
-
-    // Initialize or reset user session
-    userSessions[userId] = { 
+    // Initialize or update user session
+    userSessions[userId] = {
+        ...userSession,
         step: 'awaiting_start',
         telegramId: userId,
         firstName: msg.from.first_name || 'User',
-        isLoggedIn: false
+        isLoggedIn: userSession.isLoggedIn || false,
+        notificationsEnabled: userSession.notificationsEnabled || false
     };
 
     try {
-        // Send welcome message with start button
+        if (userSession.isLoggedIn) {
+            await bot.sendMessage(chatId, 
+                `👋 Welcome back, ${userSession.firstName || 'User'}!\n` +
+                `Notifications: ${userSession.notificationsEnabled ? '🔔 ON' : '🔕 OFF'}\n\n` +
+                `What would you like to do next?`,
+                {
+                    reply_markup: {
+                        keyboard: [
+                            ['📋 View My Tasks'],
+                            ['🔔 ' + (userSession.notificationsEnabled ? 'Disable' : 'Enable') + ' Notifications'],
+                            ['⚙️ Settings']
+                        ],
+                        resize_keyboard: true
+                    }
+                }
+            );
+            return;
+        }
+
+        // Send welcome message with notification and start buttons
         await bot.sendMessage(chatId, 
             `👋 Welcome ${msg.from.first_name || 'there'} to ERPNext Task Bot!\n\n` +
-            `I can help you manage your ERPNext tasks right here in Telegram.`,
+            `I can help you manage your ERPNext tasks right here in Telegram.\n\n` +
+            `🔔 Enable notifications to get instant updates about your tasks!`,
             {
                 reply_markup: {
                     inline_keyboard: [
+                        [{ text: '🔔 Enable Notifications', callback_data: 'enable_notifications' }],
                         [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
                     ]
                 }
             }
         );
-        console.log('✅ Welcome message with start button sent to:', userId);
+        console.log('✅ Welcome message sent to:', userId);
     } catch (error) {
-        console.error('❌ Error sending welcome message:', error);
+        console.error('❌ Error in /start command:', error);
     }
 });
 
@@ -112,24 +116,27 @@ bot.on('callback_query', async (callbackQuery) => {
     
     try {
         if (data === 'start_over') {
-            // Reset user session
+            // Reset user session but keep notification preference
             userSessions[userId] = {
                 step: 'awaiting_start',
                 telegramId: userId,
                 firstName: userSession.firstName || 'User',
-                isLoggedIn: false
+                isLoggedIn: false,
+                notificationsEnabled: userSession.notificationsEnabled || false
             };
             
             await bot.sendMessage(chatId, '🔁 Starting over...', {
                 reply_markup: { remove_keyboard: true }
             });
             
-            // Show start button again
+            // Show start buttons again
             await bot.sendMessage(chatId, 
-                `Let's try again! Click the button below to start.`,
+                `Let's try again! What would you like to do?`,
                 {
                     reply_markup: {
                         inline_keyboard: [
+                            [{ text: '🔔 ' + (userSession.notificationsEnabled ? 'Disable' : 'Enable') + ' Notifications', 
+                               callback_data: userSession.notificationsEnabled ? 'disable_notifications' : 'enable_notifications' }],
                             [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
                         ]
                     }
@@ -137,6 +144,31 @@ bot.on('callback_query', async (callbackQuery) => {
             );
             
             await bot.answerCallbackQuery(callbackQuery.id);
+            return;
+        }
+
+        // Handle notification toggles
+        if (data === 'enable_notifications' || data === 'disable_notifications') {
+            const enable = data === 'enable_notifications';
+            userSessions[userId].notificationsEnabled = enable;
+            
+            await bot.answerCallbackQuery(callbackQuery.id, {
+                text: `🔔 Notifications ${enable ? 'enabled' : 'disabled'}!`,
+                show_alert: true
+            });
+            
+            // Update the message with current notification status
+            await bot.editMessageReplyMarkup({
+                inline_keyboard: [
+                    [{ text: '🔕 ' + (enable ? 'Disable' : 'Enable') + ' Notifications', 
+                       callback_data: enable ? 'disable_notifications' : 'enable_notifications' }],
+                    [{ text: '🚀 Get Started', callback_data: 'start_bot' }]
+                ]
+            }, {
+                chat_id: chatId,
+                message_id: callbackQuery.message.message_id
+            });
+            
             return;
         }
         
@@ -212,6 +244,162 @@ bot.on('callback_query', async (callbackQuery) => {
 });
 
 // Handle text messages
+// Function to format notification message with HTML formatting
+function formatNotification(notificationData) {
+    const { title, owner, reference_type, description } = notificationData;
+    
+    return `
+<b>${title || 'New Notification Arrived!'} <tg-emoji emoji-id="5368324170671202286">🔔</tg-emoji></b>
+  
+  Notification Details:
+    - <strong>Allocated by</strong>: ${owner || 'System'}
+    - <strong>Reference Type</strong>: ${reference_type || 'N/A'}
+    - <strong>Description</strong>: ${description || 'No description provided'}
+  
+  Tibeb Design & Build ERP
+  `;
+}
+
+// Function to send task assignment notification
+async function sendTaskAssignmentNotification(userId, taskDetails) {
+    try {
+        const userSession = userSessions[userId];
+        if (!userSession) return;
+        
+        const dueDate = taskDetails.exp_end_date ? formatDate(taskDetails.exp_end_date) : 'No due date';
+        const status = taskDetails.status || 'Open';
+        const statusIcon = getStatusIcon(status);
+        
+        // Format notification using the new function
+        const notificationMessage = formatNotification({
+            title: 'New Task Assigned!',
+            owner: taskDetails.owner || 'System',
+            reference_type: 'Task',
+            description: `📌 ${taskDetails.subject || 'No Subject'}\n` +
+                        `📝 ${taskDetails.description || 'No description'}\n` +
+                        `📅 Due: ${dueDate}\n` +
+                        `🏷️ Status: ${statusIcon} ${status}`
+        });
+        
+        await bot.sendMessage(userId, notificationMessage, {
+            parse_mode: 'HTML',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '📋 View Task', callback_data: `view_task_${taskDetails.name}` }],
+                    [
+                        { text: '✅ Mark as Done', callback_data: `status_${taskDetails.name}_Completed` },
+                        { text: '📅 Set Reminder', callback_data: `remind_${taskDetails.name}` }
+                    ]
+                ]
+            }
+        });
+    } catch (error) {
+        console.error('❌ Error sending task assignment notification:', error);
+    }
+}
+
+// Show task details when view task is clicked (using the main implementation below)
+
+// Track last seen tasks for each user
+const lastSeenTasks = {};
+
+// Function to check for new tasks and notify users
+async function checkAndNotifyNewTasks() {
+    try {
+        const now = new Date();
+        console.log(`🔍 Checking for new tasks at ${now.toISOString()}`);
+        
+        // Get all logged-in users with notifications enabled
+        const usersToNotify = Object.values(userSessions).filter(
+            user => user.isLoggedIn && user.email && user.telegramId
+        );
+        
+        for (const user of usersToNotify) {
+            try {
+                console.log(`🔍 Checking tasks for user: ${user.email}`);
+                
+                // Get user's tasks from ERPNext
+                const tasks = await getAssignedTasks(user.email, user.cookies);
+                console.log(`📋 Found ${tasks.length} tasks for ${user.email}`);
+                
+                // Initialize last seen tasks if not exists
+                if (!lastSeenTasks[user.telegramId]) {
+                    lastSeenTasks[user.telegramId] = [];
+                    console.log(`📝 Initialized task tracking for user ${user.email}`);
+                }
+                
+                // Get task IDs that are currently assigned
+                const currentTaskIds = tasks.map(task => task.name);
+                
+                // Find new tasks (those in current tasks but not in last seen)
+                const newTasks = tasks.filter(task => 
+                    !lastSeenTasks[user.telegramId].includes(task.name)
+                );
+
+                console.log(`🆕 Found ${newTasks.length} new tasks for ${user.email}`);
+                
+                // Send notifications for new tasks
+                for (const task of newTasks) {
+                    console.log(`📨 Sending notification for task: ${task.name}`);
+                    try {
+                        await sendTaskAssignmentNotification(user.telegramId, task);
+                        console.log(`✅ Notification sent for task ${task.name}`);
+                    } catch (notifyError) {
+                        console.error(`❌ Failed to send notification for task ${task.name}:`, notifyError);
+                    }
+                }
+                
+                // Update last seen tasks
+                lastSeenTasks[user.telegramId] = currentTaskIds;
+                
+            } catch (error) {
+                console.error(`❌ Error checking tasks for user ${user.email}:`, error);
+            }
+        }
+    } catch (error) {
+        console.error('❌ Error in task notification check:', error);
+    }
+}
+
+// Also check for new tasks when a user logs in
+async function checkTasksOnLogin(telegramId, email, cookies) {
+    try {
+        const tasks = await getAssignedTasks(email, cookies);
+        const userSession = userSessions[telegramId];
+        
+        if (userSession) {
+            // Only show notifications for tasks created in the last 24 hours
+            const oneDayAgo = new Date();
+            oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+            
+            const recentTasks = tasks.filter(task => {
+                const taskDate = task.creation ? new Date(task.creation) : new Date(0);
+                return taskDate > oneDayAgo;
+            });
+            
+            // Update last check time to now to avoid duplicate notifications
+            lastTaskCheck[telegramId] = new Date();
+            
+            // Only show notification if there are tasks
+            if (recentTasks.length > 0) {
+                await bot.sendMessage(telegramId, `🔔 You have ${recentTasks.length} recent tasks. Use /tasks to view them.`);
+            }
+        }
+    } catch (error) {
+        console.error(`❌ Error checking tasks on login for user ${telegramId}:`, error);
+    }
+}
+
+// Store last check time for each user
+const lastTaskCheck = {};
+
+// Check for new tasks every 1 minute
+const TASK_CHECK_INTERVAL = 1 * 60 * 1000; // 1 minute
+setInterval(checkAndNotifyNewTasks, TASK_CHECK_INTERVAL);
+
+// Also run immediately on startup
+checkAndNotifyNewTasks().catch(console.error);
+
 bot.on('message', async (msg) => {
     // Skip if message is a command or empty
     if (!msg.text && !msg.document && !msg.photo) return;
@@ -220,6 +408,32 @@ bot.on('message', async (msg) => {
     
     const chatId = msg.chat.id;
     const userId = msg.from.id;
+    
+    // Handle notification toggle from keyboard
+    if (msg.text && (msg.text.includes('Notifications') || msg.text.includes('🔔') || msg.text.includes('🔕'))) {
+        const userSession = userSessions[userId] || {};
+        const enable = msg.text.includes('Enable') || msg.text.includes('🔔');
+        userSessions[userId] = {
+            ...userSession,
+            notificationsEnabled: enable
+        };
+        
+        await bot.sendMessage(chatId, 
+            `🔔 Notifications have been ${enable ? 'enabled' : 'disabled'}.\n` +
+            `You will ${enable ? 'now receive' : 'no longer receive'} task assignment notifications.`,
+            {
+                reply_markup: {
+                    keyboard: [
+                        ['📋 View My Tasks'],
+                        [`${enable ? '🔕 Disable' : '🔔 Enable'} Notifications`],
+                        ['⚙️ Settings']
+                    ],
+                    resize_keyboard: true
+                }
+            }
+        );
+        return;
+    }
 
     // Handle file attachments
     if (msg.document || msg.photo) {
@@ -694,6 +908,22 @@ bot.on('callback_query', async (callbackQuery) => {
                 chat_id: chatId,
                 message_id: callbackQuery.message.message_id
             });
+        } else if (data.startsWith('view_task_')) {
+            const taskId = data.replace('view_task_', '');
+            // Show task details using the main implementation
+            try {
+                await showTaskDetails(chatId, userSession.email, userSession.cookies, userId, taskId);
+            } catch (error) {
+                console.error('Error showing task details:', error);
+                await bot.sendMessage(chatId, '❌ Failed to load task details. Please try again.');
+            }
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return;
+        } else if (data === 'view_tasks') {
+            // Show user's tasks
+            await showUserTasks(chatId, userSession.email, userSession.cookies, userId);
+            await bot.answerCallbackQuery(callbackQuery.id);
+            return;
         } else if (data.startsWith('status_')) {
             const status = data.replace('status_', '');
             userSession.statusFilter = status === 'All' ? null : status;
